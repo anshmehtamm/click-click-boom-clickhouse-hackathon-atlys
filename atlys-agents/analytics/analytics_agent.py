@@ -263,6 +263,31 @@ def run_analytics(run, spec_name: str, table_name: str, spec_markdown: str,
             output={"total_events": total_events, "max_unique_users": unique_users,
                     "sparse": total_events < 100})
 
+    # Log a plan span BEFORE the LLM call so a judge opening the trace sees
+    # what the agent decided to investigate and why — based on the seed results.
+    # This is derived from the seed data deterministically, not an extra LLM call.
+    sample_rows = seed_results.get("sample_size", {}).get("rows", [])
+    cvr_rows    = seed_results.get("feature_vs_baseline_cvr", {}).get("rows", [])
+    seg_rows    = seed_results.get("segment_breakdown", {}).get("rows", [])
+    plan_output = {
+        "event_types_found":   [r.get("event_type") for r in sample_rows[:8]],
+        "total_events":        total_events,
+        "unique_users":        unique_users,
+        "sparse":              total_events < 100,
+        "cohorts_to_compare":  [r.get("cohort") for r in cvr_rows],
+        "top_segments":        [
+            f"{r.get('device_type')}/{r.get('geoip_country_code')} (n={r.get('n')})"
+            for r in seg_rows[:5]
+        ],
+        "analysis_plan": (
+            "sparse table — will analyze relationship to existing funnel"
+            if total_events < 100
+            else "will compare feature vs standard conversion, then drill segment anomalies, then correlate with K1-K7"
+        ),
+    }
+    run.log(step="analytics_plan", input={"spec_name": spec_name, "table_name": table_name},
+            output=plan_output)
+
     with run.span("analytics_interpret"):
         try:
             analysis = _call_analytics(run, spec_name, table_name, spec_markdown,

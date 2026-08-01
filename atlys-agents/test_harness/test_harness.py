@@ -10,6 +10,7 @@ touches production (`atlys.*`) tables until the caller has already decided to ex
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -34,6 +35,39 @@ class TestSuiteResult:
     results: list[TestResult] = field(default_factory=list)
 
 
+_AS_QUERY_RE = re.compile(r"\bAS\s+(SELECT|WITH)\b", re.IGNORECASE)
+
+
+def _extract_select(mv_ddl: str) -> str:
+    """Pulls the query portion out of a `CREATE MATERIALIZED VIEW ... AS SELECT/WITH
+    ...` statement so it can be run standalone. Must be paren-depth-aware: a naive
+    first-match search breaks on CTEs (`WITH standard AS (SELECT ...)`), where
+    "AS (SELECT" inside the CTE list matches before the real top-level "AS SELECT"/
+    "AS WITH" boundary. Real boundary is the first `AS SELECT`/`AS WITH` at paren
+    depth 0 — a CTE's `name AS (` is always followed by `(`, never directly by the
+    SELECT/WITH keyword, so this disambiguates correctly."""
+    for m in _AS_QUERY_RE.finditer(mv_ddl):
+        prefix = mv_ddl[: m.start()]
+        if prefix.count("(") == prefix.count(")"):
+            return mv_ddl[m.start(1):]
+    return mv_ddl
+
+
+def _substitute_names(sql: str, mapping: dict[str, str]) -> str:
+    """Replaces real table/MV names with their scratch equivalents in ONE pass,
+    longest-name-first, so a scratch name that happens to contain a shorter real
+    name as a substring (e.g. scratch table `..._events__testharness__abc123`
+    containing the real name `events`) never gets re-matched and double-substituted.
+    Matches `db.name` and bare `name` forms, on word boundaries only."""
+    if not mapping:
+        return sql
+    ordered = sorted(mapping.items(), key=lambda kv: -len(kv[0]))
+    pattern = re.compile(
+        r"(?:\batlys\.)?\b(" + "|".join(re.escape(name) for name, _ in ordered) + r")\b"
+    )
+    return pattern.sub(lambda m: mapping[m.group(1)], sql)
+
+
 def build_smoke_queries(table_name: str, columns_ddl: str, pm_question_queries: list[tuple[str, str]] | None = None) -> list[tuple[str, str]]:
     """Generic smoke queries every table gets, plus any spec-specific ones the
     caller derived from the spec's "questions the PM will ask" section."""
@@ -55,6 +89,7 @@ def run_new_table_tests(
     partition_key: str,
     sample_rows: list[dict],
     smoke_queries: list[tuple[str, str]],
+    materialized_views: list[dict] | None = None,
     scratch_db: str = "atlys_staging",
 ) -> TestSuiteResult:
     client = get_client(database="default")
@@ -103,6 +138,46 @@ def run_new_table_tests(
                     description=description, test_type="query_smoke", query=q,
                     passed=False, actual=f"ERROR: {e}", duration_ms=round(elapsed, 2),
                 ))
+
+        # --- mv_integrity: test each proposed MV's underlying query against the
+        # scratch table (which has real sample data), *before* it ever touches
+        # production. Substitution is name-mapping-based (not naive sequential
+        # .replace, which double-substitutes when the scratch name embeds the real
+        # name as a substring — a real bug caught by inspecting a live failure).
+        # MVs are tested IN ORDER and each successfully-tested one is materialized
+        # into its own scratch table, so a later MV that JOINs against an earlier
+        # MV's output (a real, legitimate pattern — chained derived views) gets
+        # something real to join against instead of "table doesn't exist".
+        mv_scratch_tables: list[str] = []
+        name_map = {table_name: scratch_table}
+        try:
+            for mv in materialized_views or []:
+                mv_name = mv.get("name", f"mv_{uuid.uuid4().hex[:6]}")
+                select_sql = _substitute_names(_extract_select(mv["ddl"]), name_map)
+                t0 = time.perf_counter()
+                try:
+                    r = client.query(select_sql)
+                    elapsed = (time.perf_counter() - t0) * 1000
+                    results.append(TestResult(
+                        description=f"MV '{mv_name}' underlying query ({mv.get('answers_pm_question', '')})",
+                        test_type="mv_integrity", query=select_sql,
+                        passed=True, actual=f"ok, {r.row_count} rows returned", duration_ms=round(elapsed, 2),
+                    ))
+                    # Materialize so subsequent MVs in this list can join against it.
+                    mv_scratch_table = f"{scratch_db}.{mv_name}__testharness__{uuid.uuid4().hex[:6]}"
+                    client.command(f"CREATE TABLE {mv_scratch_table} ENGINE = MergeTree ORDER BY tuple() AS {select_sql}")
+                    mv_scratch_tables.append(mv_scratch_table)
+                    name_map[mv_name] = mv_scratch_table
+                except Exception as e:
+                    elapsed = (time.perf_counter() - t0) * 1000
+                    results.append(TestResult(
+                        description=f"MV '{mv_name}' underlying query ({mv.get('answers_pm_question', '')})",
+                        test_type="mv_integrity", query=select_sql,
+                        passed=False, actual=f"ERROR: {e}", duration_ms=round(elapsed, 2),
+                    ))
+        finally:
+            for t in mv_scratch_tables:
+                client.command(f"DROP TABLE IF EXISTS {t}")
     finally:
         client.command(f"DROP TABLE IF EXISTS {scratch_table}")
 

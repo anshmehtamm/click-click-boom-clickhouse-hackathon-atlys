@@ -64,6 +64,16 @@ class PerfReport:
         return json.dumps(self, default=_default, indent=2)
 
 
+class AllCandidatesFailedError(Exception):
+    """Every candidate (including the baseline) failed to even create/load — almost
+    always a bad columns_ddl shared across all of them, not a bad ordering key.
+    Carries the per-candidate errors so the caller can feed them back for rework."""
+
+    def __init__(self, errors: dict[str, str]):
+        self.errors = errors
+        super().__init__(f"All {len(errors)} candidates failed: {errors}")
+
+
 def run_perf_test(
     table_name: str,
     columns_ddl: str,
@@ -95,6 +105,7 @@ def run_perf_test(
         all_candidates.append(Candidate(label="baseline_legacy", ordering_key=LEGACY_ORDERING_KEY))
 
     reports: list[CandidateReport] = []
+    errors: dict[str, str] = {}
     for cand in all_candidates:
         scratch_table = f"{scratch_db}.{table_name}__{cand.label}__{uuid.uuid4().hex[:6]}"
         try:
@@ -147,8 +158,18 @@ def run_perf_test(
                     total_read_bytes=sum(qt.read_bytes for qt in query_timings),
                 )
             )
+        except Exception as e:
+            # Don't let one bad candidate (or a shared-columns_ddl bug affecting all
+            # of them identically) crash the whole pipeline — record it and move on.
+            # If a table/DDL error is genuinely candidate-independent (e.g. bad
+            # columns_ddl), every candidate will fail the same way and we raise
+            # AllCandidatesFailedError below with the details for rework.
+            errors[cand.label] = str(e)
         finally:
             client.command(f"DROP TABLE IF EXISTS {scratch_table}")
+
+    if not reports:
+        raise AllCandidatesFailedError(errors)
 
     baseline = next((r for r in reports if r.label == "baseline_legacy"), None)
     winner_pool = [r for r in reports if r.label != "baseline_legacy"] or reports

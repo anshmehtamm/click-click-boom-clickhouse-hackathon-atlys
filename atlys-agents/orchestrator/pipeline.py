@@ -16,11 +16,15 @@ import uuid
 
 from agent_meta.db import get_client
 from librechat_client import call_agent
-from perf_tool import Candidate, run_perf_test
+from perf_tool import AllCandidatesFailedError, Candidate, run_perf_test
 from test_harness import build_smoke_queries, register_tests, run_new_table_tests, run_regression_suite
 from tracing import traced_run
 
-MAX_REVISIONS = 2
+# Shared budget across review rework, test-harness failures, AND execute failures
+# (all three now feed back into the same propose->review->test->execute loop) —
+# higher than a review-only cap would need, since it now has to cover more failure
+# modes with the same total attempts.
+MAX_REVISIONS = 4
 
 
 def _extract_json(text: str) -> dict:
@@ -106,13 +110,23 @@ def _write_review(client, proposal_id: str, revision: int, review: dict, section
     return review_id
 
 
+def _as_text(value) -> str:
+    """The agent's JSON schema says `before`/`diff_summary`/`rationale` are strings,
+    but a model occasionally hands back a nested object instead (e.g. `before` as a
+    dict describing the prior section rather than a string summary of it). Coerce
+    defensively rather than letting one malformed field crash the whole write."""
+    if value is None:
+        return ""
+    return value if isinstance(value, str) else json.dumps(value)
+
+
 def _write_context_sections(client, sections: list[dict], trace_url: str):
     rows = []
     for s in sections:
         after_json = json.dumps({k: s.get(k) for k in ("title", "summary", "body", "fields", "sources")})
         rows.append([
-            str(uuid.uuid4()), s["section"], s.get("before", ""), after_json,
-            s.get("diff_summary", ""), s.get("rationale", ""), "chronicle",
+            str(uuid.uuid4()), s["section"], _as_text(s.get("before", "")), after_json,
+            _as_text(s.get("diff_summary", "")), _as_text(s.get("rationale", "")), "chronicle",
             float(s.get("confidence", 0.7)), trace_url,
         ])
     if rows:
@@ -191,15 +205,31 @@ def ingest_spec(spec_name: str, spec_markdown: str, sample_events: list[dict], p
                     Candidate(label=c["label"], ordering_key=c["ordering_key"], partition_key=c.get("partition_key", "toYYYYMM(timestamp)"))
                     for c in draft["ordering_key_candidates"]
                 ]
-                perf_report = run_perf_test(
-                    table_name=draft["table_name"],
-                    columns_ddl=draft["columns_ddl"],
-                    candidates=candidates,
-                    sample_source=flattened_events,
-                    query_patterns=_build_perf_query_patterns(draft["columns_ddl"]),
-                    sample_limit=len(sample_events),
-                    include_baseline=True,
-                )
+                try:
+                    perf_report = run_perf_test(
+                        table_name=draft["table_name"],
+                        columns_ddl=draft["columns_ddl"],
+                        candidates=candidates,
+                        sample_source=flattened_events,
+                        query_patterns=_build_perf_query_patterns(draft["columns_ddl"]),
+                        sample_limit=len(sample_events),
+                        include_baseline=True,
+                    )
+                except AllCandidatesFailedError as e:
+                    # columns_ddl itself is broken (e.g. invalid ClickHouse type
+                    # nesting) — every candidate fails identically. Don't crash the
+                    # pipeline: feed the real DDL error back to the proposer as a
+                    # rework trigger, same path as a reviewer block-finding.
+                    run.log(step="perf_evaluation_ddl_error", input=draft["columns_ddl"], output=e.errors)
+                    if revision >= MAX_REVISIONS:
+                        raise
+                    revision += 1
+                    prior_findings = [{
+                        "severity": "block", "category": "invalid_ddl",
+                        "description": f"columns_ddl failed to create in ClickHouse: {next(iter(e.errors.values()))}",
+                        "suggested_fix": "Fix the ClickHouse type syntax (e.g. LowCardinality must wrap Nullable, not the reverse: LowCardinality(Nullable(String))) and resubmit.",
+                    }]
+                    continue
                 winner = next(c for c in candidates if c.label == perf_report.winner) if perf_report.winner != "baseline_legacy" else candidates[0]
                 run.log(step="perf_winner", input=[c.label for c in candidates], output={"winner": winner.label, "speedup": perf_report.speedup_vs_baseline})
 
@@ -216,10 +246,11 @@ def ingest_spec(spec_name: str, spec_markdown: str, sample_events: list[dict], p
                 "rationale": draft.get("rationale", "") + f" | ordering key chosen by perf_tool: {perf_report.speedup_vs_baseline}x vs legacy baseline.",
             }
 
+            mv_json = [json.dumps(mv) for mv in proposal["materialized_views"]]
             proposal_id = _write_proposal(
                 meta_client, spec_name=spec_name, table_name=proposal["table_name"], ddl=proposal["ddl"],
                 ordering_key=proposal["ordering_key"], partition_key=proposal["partition_key"],
-                materialized_views=proposal["materialized_views"], perf_report=perf_report.to_json(),
+                materialized_views=mv_json, perf_report=perf_report.to_json(),
                 confidence=proposal["confidence"], rationale=proposal["rationale"],
                 status="pending_review", revision=revision, trace_url=run.url,
             ) if proposal_id is None else proposal_id
@@ -227,7 +258,7 @@ def ingest_spec(spec_name: str, spec_markdown: str, sample_events: list[dict], p
                 _update_proposal_status(
                     meta_client, proposal_id, status="pending_review", revision=revision,
                     ddl=proposal["ddl"], ordering_key=proposal["ordering_key"], partition_key=proposal["partition_key"],
-                    materialized_views=proposal["materialized_views"], perf_report=perf_report.to_json(),
+                    materialized_views=mv_json, perf_report=perf_report.to_json(),
                     confidence=proposal["confidence"], rationale=proposal["rationale"],
                 )
 
@@ -235,43 +266,88 @@ def ingest_spec(spec_name: str, spec_markdown: str, sample_events: list[dict], p
             _write_review(meta_client, proposal_id, revision, review, review.get("context_sections_used", []), run.url)
 
             final_proposal, final_review, final_flattened_events = proposal, review, flattened_events
-            if review["verdict"] == "approve":
-                break
-            if revision >= MAX_REVISIONS:
+            at_cap = revision >= MAX_REVISIONS
+            if review["verdict"] != "approve" and not at_cap:
+                revision += 1
+                prior_findings = review["findings"]
+                _update_proposal_status(meta_client, proposal_id, status="needs_rework", revision=revision)
+                continue
+            if review["verdict"] != "approve":
                 run.log(step="revision_cap_hit", input={"revision": revision}, output={"proceeding_anyway": True, "unresolved_findings": review["findings"]})
                 proposal["confidence"] = min(proposal["confidence"], 0.4)
-                break
-            revision += 1
-            prior_findings = review["findings"]
-            _update_proposal_status(meta_client, proposal_id, status="needs_rework", revision=revision)
 
-        _update_proposal_status(meta_client, proposal_id, status="approved")
+            _update_proposal_status(meta_client, proposal_id, status="approved")
 
-        with run.span("test_harness"):
-            smoke_queries = build_smoke_queries(final_proposal["table_name"], final_proposal["columns_ddl"], pm_question_queries)
-            suite = run_new_table_tests(
-                table_name=final_proposal["table_name"],
-                columns_ddl=final_proposal["columns_ddl"],
-                ordering_key=final_proposal["ordering_key"], partition_key=final_proposal["partition_key"],
-                sample_rows=final_flattened_events, smoke_queries=smoke_queries,
-            )
-            run.log(step="test_harness_result", input=None, output={"passed": suite.passed, "results": [r.__dict__ for r in suite.results]})
-            if not suite.passed:
-                _update_proposal_status(meta_client, proposal_id, status="needs_rework")
-                return {"status": "needs_rework", "reason": "test_harness_failed", "proposal_id": proposal_id, "trace_url": run.url, "test_results": [r.__dict__ for r in suite.results]}
-
-        with run.span("execute"):
-            data_client = get_client(database="atlys")
-            data_client.command(final_proposal["ddl"])
-            for mv_sql in final_proposal.get("materialized_views", []):
-                data_client.command(mv_sql)
-            if final_flattened_events:
-                body = "\n".join(json.dumps(r, default=str) for r in final_flattened_events).encode()
-                data_client.raw_insert(
-                    final_proposal["table_name"], insert_block=body, fmt="JSONEachRow",
-                    settings={"input_format_skip_unknown_fields": 1},
+            with run.span("test_harness"):
+                smoke_queries = build_smoke_queries(final_proposal["table_name"], final_proposal["columns_ddl"], pm_question_queries)
+                suite = run_new_table_tests(
+                    table_name=final_proposal["table_name"],
+                    columns_ddl=final_proposal["columns_ddl"],
+                    ordering_key=final_proposal["ordering_key"], partition_key=final_proposal["partition_key"],
+                    sample_rows=final_flattened_events, smoke_queries=smoke_queries,
+                    materialized_views=final_proposal.get("materialized_views", []),
                 )
-            run.log(step="executed", input=None, output={"table": f"atlys.{final_proposal['table_name']}"})
+                run.log(step="test_harness_result", input=None, output={"passed": suite.passed, "results": [r.__dict__ for r in suite.results]})
+                if not suite.passed:
+                    if at_cap:
+                        _update_proposal_status(meta_client, proposal_id, status="needs_rework")
+                        return {"status": "needs_rework", "reason": "test_harness_failed", "proposal_id": proposal_id, "trace_url": run.url, "test_results": [r.__dict__ for r in suite.results]}
+                    revision += 1
+                    prior_findings = [{
+                        "severity": "block", "category": "test_harness_failure",
+                        "description": f"Correctness test(s) failed: {[r.description + ': ' + r.actual for r in suite.results if not r.passed]}",
+                        "suggested_fix": "Fix the failing query/MV logic (check column names, types, and join keys) and resubmit.",
+                    }]
+                    _update_proposal_status(meta_client, proposal_id, status="needs_rework", revision=revision)
+                    continue
+
+            # Real execution — rolled back on any failure and fed back as rework,
+            # same pattern as perf_evaluation/review/test_harness. Increasingly
+            # sophisticated MV SQL (CTEs, TO targets, refreshable views) keeps
+            # surfacing new ClickHouse edge cases the scratch tests don't catch
+            # (e.g. an MV's own ORDER BY using a Nullable column) — bounded
+            # feed-back-and-retry handles unknown failure modes generically instead
+            # of us hand-patching every possible DDL quirk in advance.
+            try:
+                with run.span("execute"):
+                    data_client = get_client(database="atlys")
+                    data_client.command(final_proposal["ddl"])
+                    for mv in final_proposal.get("materialized_views", []):
+                        # Some MVs are 2 statements: a backing table (for a `TO`
+                        # target) plus the CREATE MATERIALIZED VIEW itself.
+                        # ClickHouse's HTTP interface rejects multi-statement
+                        # bodies, so split and run each.
+                        for stmt in mv["ddl"].split(";"):
+                            stmt = stmt.strip()
+                            if stmt:
+                                data_client.command(stmt)
+                    if final_flattened_events:
+                        body = "\n".join(json.dumps(r, default=str) for r in final_flattened_events).encode()
+                        data_client.raw_insert(
+                            final_proposal["table_name"], insert_block=body, fmt="JSONEachRow",
+                            settings={"input_format_skip_unknown_fields": 1},
+                        )
+                    run.log(step="executed", input=None, output={"table": f"atlys.{final_proposal['table_name']}"})
+            except Exception as e:
+                run.log(step="execute_error", input=final_proposal["ddl"], output=str(e))
+                data_client.command(f"DROP TABLE IF EXISTS atlys.{final_proposal['table_name']}")
+                for mv in final_proposal.get("materialized_views", []):
+                    if mv.get("name"):
+                        data_client.command(f"DROP TABLE IF EXISTS atlys.{mv['name']}")
+                        data_client.command(f"DROP VIEW IF EXISTS atlys.{mv['name']}")
+                if at_cap:
+                    _update_proposal_status(meta_client, proposal_id, status="rejected")
+                    return {"status": "rejected", "reason": "execute_failed", "proposal_id": proposal_id, "trace_url": run.url, "error": str(e)}
+                revision += 1
+                prior_findings = [{
+                    "severity": "block", "category": "invalid_ddl",
+                    "description": f"Real execution against ClickHouse failed: {e}",
+                    "suggested_fix": "Fix the DDL error (check ORDER BY doesn't reference Nullable columns, multi-statement DDLs are correctly separated, etc.) and resubmit.",
+                }]
+                _update_proposal_status(meta_client, proposal_id, status="needs_rework", revision=revision)
+                continue
+
+            break
 
         _update_proposal_status(meta_client, proposal_id, status="executed")
         register_tests(proposal_id, final_proposal["table_name"], smoke_queries)

@@ -27,15 +27,22 @@ list_context_sections to see what's available; section key prefixes:
 """
 
 TOOLS_NOTE = """
-You have real tools, not a pre-bundled context dump — use them:
+You have real tools, not a pre-bundled context dump — use them, but every call
+costs real tokens that stay in context for the rest of this conversation, so be
+deliberate, not exhaustive:
 - list_context_sections() — see every context section (key, summary, confidence)
   before deciding what to read in full.
-- lookup_context(sections: [...]) — fetch full content for specific section keys.
-- list_databases() / list_tables(database) — see what's actually in ClickHouse.
-- run_query(query) — run a READ-ONLY query against real Atlys data (scoped to the
-  `atlys` database; writes are rejected server-side). Use this to check real
-  cardinality/nulls/distributions instead of guessing from a small sample, or to
-  verify a claim before relying on it.
+- lookup_context(sections: [...]) — fetch full content for specific section keys
+  (batch the ones you need into one call rather than calling it repeatedly).
+- list_tables(database) — table names + row counts only (cheap). For column
+  details on a table you already know you need, use describe_table(table_name) —
+  ONE table at a time, there's no bulk "describe everything" on purpose.
+- run_query(query) — READ-ONLY, scoped to `atlys`. Small results come back inline;
+  large ones are saved to a scratch file with a preview + row count, and you get
+  grep_scratch(file, pattern) / read_scratch(file, start_line, n_lines) to inspect
+  the rest — use those instead of re-running or widening the query to "just see it
+  all." Prefer aggregate queries (GROUP BY/count/uniq) over row dumps in the first
+  place; add your own LIMIT for exploratory SELECTs.
 Call list_context_sections early — don't skip straight to guessing section keys.
 Stop calling tools once you have what you need; don't pad the trace with queries
 that don't change your answer. Your final message must be ONLY the JSON output.
@@ -68,6 +75,10 @@ Design rules:
   (with an `event_type` or per-event boolean/nullable-column pattern) or SEPARATE
   tables (one per event, matching the existing 8-table convention). State the
   tradeoff in your rationale — don't silently pick one.
+- ClickHouse type nesting order matters and is a real DDL error, not a style choice:
+  `LowCardinality(Nullable(String))` is valid, `Nullable(LowCardinality(String))` is
+  NOT (ClickHouse rejects it outright). If a column is both nullable and
+  low-cardinality, Nullable must be the inner type.
 - `columns_ddl` is ONLY the column definitions (no ENGINE/PARTITION/ORDER BY) — the
   orchestrator appends those once perf_tool picks a winner among your candidates.
 - Propose 2-3 `ordering_key_candidates`. Every candidate's ordering key must be built
@@ -77,9 +88,25 @@ Design rules:
   timestamp first in at least one candidate if the spec's PM questions imply
   time-range filtering (they almost always do) — give each candidate a one-line
   rationale for what access pattern it's optimized for.
-- Only propose materialized views if the spec's PM questions clearly need a rollup
-  (e.g. a daily/segment aggregate reused across many questions) — don't add MVs
-  speculatively. Materialized view SQL may reference the table by its `table_name`.
+- **Go through the spec's PM questions one by one and classify each one:**
+  (a) servable directly from the base table with a simple filter/GROUP BY — no MV
+  needed, note this explicitly rather than defaulting to silence; or
+  (b) needs a derived/materialized view because it requires a rollup reused across
+  many queries, a cross-table JOIN, a funnel/sequencing calculation, or a window
+  function the base table alone can't answer cheaply. A PM question like "does this
+  feature lift conversion vs. the existing funnel" is case (b) almost by definition —
+  it needs the new table joined against existing ones (e.g. `purchase_completed`,
+  `pay_now_clicked`), not just this feature's own events in isolation.
+  DO NOT default to an empty `materialized_views` array just because it's easier —
+  an empty array is only correct if every PM question is genuinely case (a), and you
+  must say why in `rationale`.
+- For any case-(b) view: use your ClickHouse tools (`list_tables`, `run_query`
+  against `system.columns`) to find the REAL column names and join keys in whatever
+  existing table(s) you need to join against — don't guess a join key name, verify it.
+  Then write the actual `CREATE MATERIALIZED VIEW ... AS SELECT ...` (with a backing
+  target table via `TO db.table_name` or an AggregatingMergeTree/SummingMergeTree
+  target — pick what fits the aggregation), including the JOIN, GROUP BY, or window
+  function the question needs.
 - confidence (0-1): based on how directly the raw NDJSON sample supports your typing
   choices, and what fraction of raw fields you could cleanly map.
 
@@ -91,7 +118,12 @@ Output ONLY this JSON object:
     {{"label": "short_label", "ordering_key": "(col_a, col_b)", "partition_key": "toYYYYMM(timestamp)", "rationale": "what access pattern this favors"}}
   ],
   "column_mapping": {{"raw_field_or_event": "column_name"}},
-  "materialized_views": ["full CREATE MATERIALIZED VIEW statements, or empty array"],
+  "pm_question_coverage": [
+    {{"question": "quoted or paraphrased from the spec", "servable_by": "base_table | materialized_view", "note": "why"}}
+  ],
+  "materialized_views": [
+    {{"name": "string, snake_case", "answers_pm_question": "which question this exists for", "ddl": "full CREATE MATERIALIZED VIEW ... AS SELECT ... statement, including any JOIN"}}
+  ],
   "confidence": 0.0,
   "rationale": "why this design, including the one-table-vs-many-tables decision and what you checked via tools"
 }}
@@ -110,6 +142,15 @@ Always call list_context_sections and pull the sections relevant to this proposa
 domain before judging it — don't review from the proposal text alone. Use run_query
 when a finding hinges on a factual claim about real data (e.g. "does this grain
 actually match what's in the raw sample" is better answered by checking, not assuming).
+
+If the proposal includes `materialized_views` with JOINs against existing tables,
+verify the join keys and column names it references actually exist and actually mean
+what the proposal assumes (`run_query` against `system.columns`, or a small test
+SELECT) — a plausible-looking JOIN on a column that doesn't exist, or that exists but
+means something different than assumed, is a `block`-severity `contradicts_context`
+or `metric_incompatible` finding, not a nitpick. Also check `pm_question_coverage`
+for gaps: a PM question marked "servable_by: base_table" that actually needs a
+cross-table join is a `metric_incompatible` finding.
 
 Check every proposal against these categories. Only raise a finding you can support
 by citing a specific context section (by key) or a specific tool result — do not
@@ -242,7 +283,16 @@ Output ONLY this JSON object:
 # empirically against a real agent — see Constants.mcp_delimiter in LibreChat's
 # packages/data-provider/src/config.ts).
 _CONTEXT_TOOLS = ["list_context_sections_mcp_atlys_context", "lookup_context_mcp_atlys_context"]
-_CLICKHOUSE_TOOLS = ["list_databases_mcp_atlys_clickhouse", "list_tables_mcp_atlys_clickhouse", "run_query_mcp_atlys_clickhouse"]
+# atlys_data, not atlys_clickhouse (the official mcp-clickhouse server) — measured
+# atlys_clickhouse's list_tables at ~15,500 tokens per call, which compounded across
+# a multi-turn tool loop into ~90-100K input tokens for a single agent invocation.
+# atlys_data is a lean, size-capped replacement with the same read-only guarantees
+# (see mcp_servers/data_tools_server.py) plus a grep/read-scratch escape hatch for
+# any query that's still legitimately large.
+_CLICKHOUSE_TOOLS = [
+    "list_tables_mcp_atlys_data", "describe_table_mcp_atlys_data", "run_query_mcp_atlys_data",
+    "grep_scratch_mcp_atlys_data", "read_scratch_mcp_atlys_data",
+]
 
 AGENTS = {
     "instrumentation_proposer": {

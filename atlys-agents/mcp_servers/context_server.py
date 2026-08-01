@@ -12,11 +12,18 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from mcp.server import MCPServer
+from mcp.server import FastMCP
 
 from agent_meta.db import get_client
 
-server = MCPServer(name="atlys_context", instructions="Query the Atlys business/data context layer.")
+# NOTE: mcp-clickhouse's dependency pins downgraded the `mcp` package (2.0.0 ->
+# 1.29.0) after it was installed, which renamed MCPServer -> FastMCP and moved
+# host/port/stateless_http from run() kwargs to the constructor. Keep both MCP
+# servers on this same version — don't let one upgrade silently break the other.
+server = FastMCP(
+    name="atlys_context", instructions="Query the Atlys business/data context layer.",
+    host="0.0.0.0", port=8100, stateless_http=True,
+)
 
 
 @server.tool()
@@ -53,4 +60,4 @@ def lookup_context(sections: list[str]) -> list[dict]:
 
 
 if __name__ == "__main__":
-    server.run(transport="streamable-http", host="0.0.0.0", port=8100, stateless_http=True)
+    server.run(transport="streamable-http")

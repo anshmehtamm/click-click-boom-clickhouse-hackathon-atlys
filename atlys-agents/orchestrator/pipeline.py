@@ -17,7 +17,7 @@ import uuid
 from collections import Counter
 
 from agent_meta.db import get_client
-from librechat_client import call_agent
+from orchestrator.agent_io import AgentOutputError, _call_json_agent, _log_agent_call, _extract_json
 from perf_tool import AllCandidatesFailedError, Candidate, run_perf_test
 from test_harness import build_smoke_queries, register_tests, run_new_table_tests, run_regression_suite
 from tracing import traced_run
@@ -41,47 +41,9 @@ SCRATCH_DIR.mkdir(exist_ok=True)
 MAX_REVISIONS = 4
 
 
-class AgentOutputError(Exception):
-    """Raised when an agent's final message isn't valid JSON. Carries the raw text
-    so a caller can decide whether to retry-once (cheap, malformed JSON usually
-    isn't a design problem worth burning a full rework revision on) or feed it into
-    a proper rework round."""
-
-    def __init__(self, raw_text: str, parse_error: Exception):
-        self.raw_text = raw_text
-        self.parse_error = parse_error
-        super().__init__(f"Agent output was not valid JSON: {parse_error}")
-
-
-def _extract_json(text: str) -> dict:
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.split("```")[1]
-        if cleaned.startswith("json"):
-            cleaned = cleaned[4:]
-    try:
-        return json.loads(cleaned.strip())
-    except json.JSONDecodeError as e:
-        raise AgentOutputError(text, e) from e
-
-
-def _call_json_agent(agent_id: str, payload: dict) -> dict:
-    """Calls an agent expecting JSON back; if the output doesn't parse, retries
-    ONCE with the parse error appended so the model can just fix its formatting —
-    cheap, and avoids burning a full rework revision on something that usually
-    isn't a design problem. Raises AgentOutputError if it still fails."""
-    r = call_agent(agent_id, json.dumps(payload))
-    try:
-        return _extract_json(r.output_text), r
-    except AgentOutputError as e:
-        retry_payload = dict(payload)
-        retry_payload["_previous_output_was_invalid_json"] = {
-            "your_previous_output": e.raw_text[:2000],
-            "parse_error": str(e.parse_error),
-            "instruction": "Output ONLY the JSON object this time — no markdown fences, no prose before or after it.",
-        }
-        r2 = call_agent(agent_id, json.dumps(retry_payload))
-        return _extract_json(r2.output_text), r2
+# AgentOutputError, _extract_json, _call_json_agent, _log_agent_call now live in
+# orchestrator/agent_io.py so analytics_agent.py can import them without creating
+# a circular dependency (pipeline lazily imports analytics_agent at call time).
 
 
 def _get_nested(d: dict, dotted_key: str):
@@ -204,53 +166,7 @@ def _build_perf_query_patterns(columns_ddl: str) -> list[str]:
     return patterns
 
 
-def _log_agent_call(run, step: str, input_data, result, reasoning: str | None = None, **metadata):
-    """Logs the call as a span with its own nested child span per tool call the agent
-    actually made — so a judge opening the trace sees the real reasoning chain (which
-    tools, what args, in what order), not one opaque call.
-
-    `reasoning`: LibreChat's Agents API (beta) does not surface model reasoning/thinking
-    content at all right now — confirmed via direct testing, including with an explicit
-    `reasoning.summary: "auto"` request param, which still returns no reasoning item in
-    the output array. The closest real analog is the agent's OWN stated rationale inside
-    its structured JSON response (e.g. the proposer's `rationale` field, or the
-    reviewer's `verdict` + finding descriptions) — callers extract that and pass it
-    through here so it surfaces as the one-line preview under the step, same as any
-    other reasoning would."""
-    with run.span(step, **metadata) as span:
-        # Log the main LLM generation with full input/output and usage
-        run.log(
-            step=f"{step}_generation",
-            input=input_data,
-            output=result.output_text,  # Full output, not truncated
-            usage=result.usage if result.usage else None,
-            reasoning=reasoning,
-            n_tool_calls=len(result.tool_calls)
-        )
-        # Log each tool call separately for detailed tracing
-        for i, tc in enumerate(result.tool_calls):
-            # Extract execution_time_ms from tool output if present (for ClickHouse queries)
-            tool_metadata = {}
-            tool_output = tc.get("output")
-            if tool_output:
-                try:
-                    # Tool output might be a JSON string or already parsed dict
-                    if isinstance(tool_output, str):
-                        output_dict = json.loads(tool_output)
-                    else:
-                        output_dict = tool_output
-
-                    if isinstance(output_dict, dict) and "execution_time_ms" in output_dict:
-                        tool_metadata["execution_time_ms"] = output_dict["execution_time_ms"]
-                except (json.JSONDecodeError, TypeError):
-                    pass  # Not JSON or not a dict, skip timing extraction
-
-            run.log(
-                step=f"{step}_tool[{i}]_{tc.get('name')}",
-                input=tc.get("arguments"),
-                output=tool_output,
-                **tool_metadata
-            )
+# _log_agent_call moved to orchestrator/agent_io.py
 
 
 def _record_findings(history: list[dict], new_findings: list[dict], round_num: int) -> list[dict]:
@@ -637,8 +553,26 @@ def ingest_spec(
                 run.log(step="chronicle_json_error", input=e.raw_text[:1000], output=str(e.parse_error))
                 chronicle_ok = False
 
+        # Analytics: runs after chronicle so context_versions includes the new table.
+        # Non-fatal — a failed insight write never rolls back the executed schema.
+        insight_result = None
+        try:
+            from analytics.analytics_agent import run_analytics
+            insight_result = run_analytics(
+                run=run,
+                spec_name=spec_name,
+                table_name=final_proposal["table_name"],
+                spec_markdown=spec_markdown,
+                meta_client=meta_client,
+            )
+        except Exception as e:
+            run.log(step="analytics_error", input=None, output=str(e))
+
         return {
             "status": "executed", "proposal_id": proposal_id, "table_name": final_proposal["table_name"],
             "ddl": final_proposal["ddl"], "revisions": revision, "regression_passed": regression.passed,
             "chronicle_ok": chronicle_ok, "trace_url": run.url,
+            "insight_title": insight_result.get("title") if insight_result else None,
+            "insight_confidence": insight_result.get("confidence") if insight_result else None,
+            "insight_id": insight_result.get("insight_id") if insight_result else None,
         }

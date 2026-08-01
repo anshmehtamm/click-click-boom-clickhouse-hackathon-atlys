@@ -39,17 +39,31 @@ load_dotenv()
 
 # Import ClickStack integration (but don't initialize yet - we'll do it after first Langfuse call)
 from .hyperdx_integration import init_hyperdx, get_tracer, log_to_hyperdx
+from dashboard.emitter import emit_event
 
 _clickstack_initialized = False
+
+
+def _step_kind(step: str) -> str:
+    """Classifies a step name for the dashboard's UI (icon/color per row), purely
+    cosmetic — matches the naming convention orchestrator/pipeline.py's
+    _log_agent_call already uses (`{step}_generation`, `{step}_tool[i]_{name}`)."""
+    if "_tool[" in step:
+        return "tool_call"
+    if step.endswith("_generation"):
+        return "generation"
+    return "log"
 
 
 class Run:
     """Wraps one Langfuse trace for a full pipeline run (e.g. one spec's
     propose -> review -> [rework] -> test -> execute -> commit sequence)."""
 
-    def __init__(self, client, root_span):
+    def __init__(self, client, root_span, agent: str = "", spec: str = ""):
         self._client = client
         self._root_span = root_span
+        self.agent = agent
+        self.spec = spec
 
     @property
     def trace_id(self) -> str:
@@ -73,6 +87,22 @@ class Run:
             langfuse_url=self.url,
             **meta
         )
+
+        # Log to realtime dashboard (best-effort, see dashboard/emitter.py)
+        emit_event({
+            "event": "log",
+            "kind": _step_kind(step),
+            "trace_id": self.trace_id,
+            "trace_url": self.url,
+            "agent": self.agent,
+            "spec": self.spec,
+            "step": step,
+            "input": input,
+            "output": output,
+            "reasoning": reasoning,
+            "usage": usage,
+            "metadata": metadata,
+        })
 
         # Use "generation" type if usage data is provided (LLM call), otherwise "span"
         observation_type = "generation" if usage else "span"
@@ -104,6 +134,12 @@ class Run:
             langfuse_url=self.url,
             **metadata
         )
+        emit_event({
+            "event": "span_start", "kind": "span",
+            "trace_id": self.trace_id, "trace_url": self.url,
+            "agent": self.agent, "spec": self.spec,
+            "step": name, "metadata": metadata,
+        })
 
         with self._client.start_as_current_observation(
             name=name, as_type="span", metadata=metadata or None
@@ -119,6 +155,12 @@ class Run:
                     langfuse_url=self.url,
                     **metadata
                 )
+                emit_event({
+                    "event": "span_end", "kind": "span",
+                    "trace_id": self.trace_id, "trace_url": self.url,
+                    "agent": self.agent, "spec": self.spec,
+                    "step": name, "metadata": metadata,
+                })
 
 
 @contextlib.contextmanager
@@ -144,7 +186,7 @@ def traced_run(agent: str, spec: str, **extra_tags):
 
     with client.start_as_current_observation(name=f"{agent}:{spec}", as_type="span") as root_span:
         with propagate_attributes(tags=tags, metadata={"agent": agent, "spec": spec, **extra_tags}):
-            run = Run(client, root_span)
+            run = Run(client, root_span, agent=agent, spec=spec)
 
             # Log trace start to ClickStack
             log_to_hyperdx(
@@ -156,6 +198,11 @@ def traced_run(agent: str, spec: str, **extra_tags):
                 spec=spec,
                 **extra_tags
             )
+            emit_event({
+                "event": "trace_start", "kind": "trace",
+                "trace_id": run.trace_id, "trace_url": run.url,
+                "agent": agent, "spec": spec, "metadata": extra_tags,
+            })
 
             try:
                 yield run
@@ -170,4 +217,9 @@ def traced_run(agent: str, spec: str, **extra_tags):
                     spec=spec,
                     **extra_tags
                 )
+                emit_event({
+                    "event": "trace_end", "kind": "trace",
+                    "trace_id": run.trace_id, "trace_url": run.url,
+                    "agent": agent, "spec": spec, "metadata": extra_tags,
+                })
                 client.flush()

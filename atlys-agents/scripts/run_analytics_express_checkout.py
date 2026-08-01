@@ -80,22 +80,14 @@ else:
     if not row:
         failures.append(f"FAIL: insight_id {insight_id} not found in agent_meta.insights")
 
-# 2. evidence contains at least one query with returned numbers
-evidence_raw = result.get("evidence", {})
-if isinstance(evidence_raw, str):
-    try:
-        evidence_raw = json.loads(evidence_raw)
-    except Exception:
-        evidence_raw = {}
-if not evidence_raw or not isinstance(evidence_raw, dict):
-    failures.append("FAIL: evidence is empty or not a dict")
-else:
-    has_numbers = any(
-        isinstance(v, dict) and v.get("key_numbers") and v.get("n") is not None
-        for v in evidence_raw.values()
-    )
-    if not has_numbers:
-        failures.append("FAIL: no evidence entry has key_numbers + n (grounding broken)")
+# 2. report_html is a real, non-trivial standalone document (the agent now
+#    explores and writes its own report instead of returning a seed-query
+#    evidence blob — see analytics/analytics_agent.py's module docstring)
+report_html = result.get("report_html", "")
+if not report_html or len(report_html) < 200:
+    failures.append("FAIL: report_html is empty or suspiciously short")
+elif "<html" not in report_html.lower():
+    failures.append("FAIL: report_html doesn't look like a standalone HTML document")
 
 # 3. confidence is low given sparse data (< 0.85 expected)
 confidence = result.get("confidence", 0.0)

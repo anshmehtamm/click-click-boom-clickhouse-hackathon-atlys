@@ -85,7 +85,8 @@ CREATE TABLE IF NOT EXISTS agent_meta.insights
     evidence String,
     related_known_issues Array(String),
     confidence Float32,
-    trace_url String
+    trace_url String,
+    report_html String DEFAULT ''   -- self-contained HTML insight report (see analytics/analytics_agent.py)
 )
 ENGINE = MergeTree
 ORDER BY (spec_name, ts);

@@ -1,14 +1,29 @@
-"""Analytics Agent — the query→interpret→drill→correlate→write loop.
+"""Analytics Agent — genuine multi-turn exploration, not pre-baked seed queries.
 
-Design: the orchestrator runs deterministic seed queries (small result sets),
-fetches relevant context sections, then calls the LibreChat analytics agent
-ONCE with that pre-computed evidence. The LibreChat agent then loops via its
-MCP tools (run_query for drills, lookup_context for known-issue checks) and
-produces the final structured JSON.
+Design (revised): the orchestrator does NOT run deterministic "seed queries" or
+pre-fetch context sections anymore. That approach silently produced wrong numbers
+whenever a table's shape didn't match the seed queries' baked-in assumptions — a
+real run computed a 0.0% "feature adoption rate" for a table whose feature actors
+are keyed by `share_id`, not `user_id`, because the generic seed query joined on
+the wrong column and nobody (query or LLM) caught it until manual inspection.
 
-ClickHouse computes, the LLM interprets. No raw row dumps ever reach the LLM.
-Every query result is logged as a Langfuse span so each number in the insight
-traces back to the query that produced it.
+Instead, the LibreChat analytics agent gets a minimal payload (spec_name,
+table_name, database, spec_markdown) and does everything itself via its own MCP
+tools: load the `context-engine` skill, explore context sections, inspect the
+table's real shape, then answer the spec's PM questions one by one with queries it
+writes itself — genuinely agentic, not templated. It's the same tool-loop pattern
+already used by the proposer/reviewer/chronicler agents.
+
+Output changed too: instead of a JSON evidence blob the dashboard renders into
+fixed chart components, the agent now writes a complete, self-contained HTML
+report (see ANALYTICS_AGENT in agents/prompts.py for the exact structure it's
+told to produce) — persisted alongside the summary fields so a list view can show
+the short version and link out to the full report.
+
+One deterministic check remains: a bare `SELECT count()` for the orchestrator's
+hard small-n confidence cap. This carries no interpretive assumption about how
+the table is keyed (unlike the old seed queries), so it doesn't reintroduce the
+failure mode being removed here — it's a safety net, not evidence handed to the LLM.
 """
 from __future__ import annotations
 
@@ -17,175 +32,46 @@ import os
 import uuid
 
 from agent_meta.db import get_client
-from librechat_client import call_agent
 
 # Import shared agent helpers from their own module to avoid a circular import
 # (pipeline.py lazily imports analytics_agent; analytics_agent must not import
 # pipeline at module load time or the cycle breaks when the lazy import is hoisted).
 from orchestrator.agent_io import AgentOutputError, _call_json_agent, _log_agent_call
 
-# ── context sections the analytics agent always needs ───────────────────────
 
-_REQUIRED_CONTEXT_SECTIONS = [
-    "metric:conversion_rate",
-    "metric:drop_off_rate",
-    "metric:step_through_rate",
-    "metric:on_time_delivery_rate",   # to KNOW it's uncomputable — don't fabricate
-    "metric:revenue_per_conversion",
-    "relationship:join_map",
-    "issue:K1", "issue:K2", "issue:K3", "issue:K4",
-    "issue:K5", "issue:K6", "issue:K7",
-    "convention:funnel_analysis",
-    "convention:segment_cuts",
-    "dataquality:envelope",
-    "overview:business",
-]
+def _total_row_count(table_name: str) -> int:
+    """Bare row count, purely for the orchestrator's hard confidence cap below —
+    NOT handed to the LLM as evidence. No join, no assumption about how the table
+    is keyed, so this can't produce the wrong-join-key failure mode the old seed
+    queries had."""
+    client = get_client(database="atlys")
+    try:
+        return client.query(f"SELECT count() FROM atlys.{table_name}").result_rows[0][0]
+    except Exception:
+        return 0
 
 
-def _fetch_context(table_name: str) -> dict[str, str]:
-    """Pull the required context sections from agent_meta.current_context.
-    Returns {section_key: content_json_string}. Adds the new table's section
-    dynamically so the agent knows the Chronicler's grain/join-key description."""
-    client = get_client(database="agent_meta")
-    sections = _REQUIRED_CONTEXT_SECTIONS + [f"table:{table_name}"]
-    # Use tuple string-formatting (not parameter binding) — the team confirmed
-    # clickhouse-connect's IN %(x)s binding is unreliable for list params; the
-    # existing smoke_test_agents.py uses this same pattern.
-    sections_tuple = tuple(sections)
-    rows = client.query(
-        f"SELECT section, content FROM current_context WHERE section IN {sections_tuple}",
-    ).result_rows
-    return {row[0]: row[1] for row in rows}
-
-
-# ── seed query templates ─────────────────────────────────────────────────────
-# Each returns a small result set (< 50 rows). Parameterized by table name.
-# These run deterministically in the orchestrator; results are handed to the
-# LLM as pre-computed evidence. The LLM then decides which additional drill
-# queries to run via its run_query MCP tool.
-
-def _q_sample_size(table: str) -> str:
-    """Always first: count per event type + unique users — the small-n gate."""
-    return (
-        f"SELECT COALESCE(event_type, 'all_events') AS event_type, "
-        f"count() AS n, uniqExact(user_id) AS unique_users "
-        f"FROM atlys.{table} GROUP BY event_type ORDER BY n DESC LIMIT 20"
-    )
-
-
-def _q_feature_adoption(table: str) -> str:
-    """Of all users who started an application, how many used this feature."""
-    return (
-        f"SELECT uniqExact(f.user_id) AS feature_users, "
-        f"uniqExact(a.user_id) AS all_started_users, "
-        f"round(uniqExact(f.user_id) / greatest(uniqExact(a.user_id), 1), 4) AS adoption_rate "
-        f"FROM atlys.application_started a "
-        f"LEFT JOIN (SELECT DISTINCT user_id FROM atlys.{table}) f USING (user_id)"
-    )
-
-
-def _q_feature_vs_baseline_conversion(table: str) -> str:
-    """Feature users vs non-feature users: conversion to purchase_completed."""
-    return (
-        f"SELECT if(f.user_id != '', 'feature', 'standard') AS cohort, "
-        f"uniqExact(a.user_id) AS started, "
-        f"uniqExactIf(pc.user_id, pc.user_id != '') AS converted, "
-        f"round(uniqExactIf(pc.user_id, pc.user_id != '') / greatest(uniqExact(a.user_id), 1), 4) AS conv_rate "
-        f"FROM atlys.application_started a "
-        f"LEFT JOIN atlys.purchase_completed pc USING (application_id) "
-        f"LEFT JOIN (SELECT DISTINCT user_id FROM atlys.{table}) f USING (user_id) "
-        f"GROUP BY cohort ORDER BY cohort"
-    )
-
-
-def _q_segment_breakdown(table: str) -> str:
-    """Feature usage by device_type / os / geoip_country_code — always cut these."""
-    return (
-        f"SELECT device_type, os, geoip_country_code, "
-        f"count() AS n, uniqExact(user_id) AS unique_users "
-        f"FROM atlys.{table} "
-        f"GROUP BY device_type, os, geoip_country_code ORDER BY n DESC LIMIT 30"
-    )
-
-
-def _q_existing_funnel_baseline() -> str:
-    """Current funnel step sizes — gives context for adoption/conversion numbers."""
-    return (
-        "SELECT 'destination_card_clicked' AS step, uniqExact(user_id) AS users "
-        "FROM atlys.destination_card_clicked "
-        "UNION ALL SELECT 'application_started', uniqExact(user_id) FROM atlys.application_started "
-        "UNION ALL SELECT 'document_uploaded', uniqExact(user_id) FROM atlys.document_uploaded "
-        "UNION ALL SELECT 'purchase_completed', uniqExact(user_id) FROM atlys.purchase_completed"
-    )
-
-
-def _q_destination_mix(table: str) -> str:
-    """Top destinations in the feature table — cross-reference with K4 (Schengen)."""
-    return (
-        f"SELECT destination, count() AS n, uniqExact(user_id) AS users "
-        f"FROM atlys.{table} GROUP BY destination ORDER BY n DESC LIMIT 15"
-    )
-
-
-# ── query runner ─────────────────────────────────────────────────────────────
-
-def _run_seed_queries(run, table_name: str) -> dict[str, dict]:
-    """Run all seed queries. Returns {query_name: {sql, rows, n}} where n is
-    the total row count / user count from the result (for small-n gating)."""
-    ch = get_client(database="atlys")
-    results: dict[str, dict] = {}
-
-    queries = {
-        "sample_size":              _q_sample_size(table_name),
-        "feature_adoption":         _q_feature_adoption(table_name),
-        "feature_vs_baseline_cvr":  _q_feature_vs_baseline_conversion(table_name),
-        "segment_breakdown":        _q_segment_breakdown(table_name),
-        "funnel_baseline":          _q_existing_funnel_baseline(),
-        "destination_mix":          _q_destination_mix(table_name),
-    }
-
-    for name, sql in queries.items():
-        with run.span(f"compute_{name}"):
-            try:
-                result = ch.query(sql)
-                rows = result.result_rows
-                cols = result.column_names
-                # Convert to list-of-dicts for readability
-                rows_as_dicts = [dict(zip(cols, row)) for row in rows]
-                # Cap at 50 rows before handing to LLM
-                rows_as_dicts = rows_as_dicts[:50]
-                total_n = sum(r.get("n", r.get("unique_users", 1)) for r in rows_as_dicts) if rows_as_dicts else 0
-                results[name] = {"sql": sql.strip(), "rows": rows_as_dicts, "n": int(total_n)}
-                run.log(step=f"compute_{name}_result", input=sql.strip(),
-                        output={"rows_returned": len(rows_as_dicts), "n": int(total_n), "preview": rows_as_dicts[:5]})
-            except Exception as e:
-                results[name] = {"sql": sql.strip(), "rows": [], "n": 0, "error": str(e)}
-                run.log(step=f"compute_{name}_error", input=sql.strip(), output=str(e))
-
-    return results
-
-
-# ── analytics call ───────────────────────────────────────────────────────────
-
-def _call_analytics(run, spec_name: str, table_name: str, spec_markdown: str,
-                    seed_results: dict, context: dict) -> dict:
-    """Calls the LibreChat analytics agent with pre-computed evidence + context.
-    The agent then loops via its MCP tools (run_query for drills, lookup_context
-    for known-issue verification) and returns the final structured JSON."""
+def _call_analytics(run, spec_name: str, table_name: str, spec_markdown: str) -> dict:
+    """Calls the LibreChat analytics agent with a minimal payload. The agent loops
+    via its own MCP tools (context-engine skill, list_context_sections/
+    lookup_context, describe_table, run_query, execute_python) to explore the
+    table and answer the spec's PM questions, then returns the final structured
+    JSON including a full HTML report."""
     payload = {
         "trigger": "new_table_executed",
         "spec_name": spec_name,
         "table_name": table_name,
         "database": "atlys",
-        # Cap spec markdown to 2500 chars — PM questions section is what matters
-        "spec_summary": spec_markdown[:2500],
-        "pre_computed_queries": seed_results,
-        "context_sections": context,
+        # Full spec, not truncated — the "Questions the PM will ask" section is
+        # what the agent works through one by one, and truncating risks cutting
+        # it off for a longer spec.
+        "spec_markdown": spec_markdown,
         "instruction": (
             "A new feature table has just been instrumented into ClickHouse. "
-            "Analyze the pre-computed query results above, then use your tools to "
-            "drill into anomalies and verify known-issue matches. "
-            "Produce a PM-facing insight following your system prompt's loop."
+            "Follow your system prompt's stages in order: load context-engine "
+            "first, understand this table's real shape before querying it, "
+            "answer the spec's PM questions one by one with your own queries, "
+            "correlate with known issues, then write the full HTML report."
         ),
     }
     result, r = _call_json_agent(os.environ["LIBRECHAT_AGENT_ANALYTICS"], payload)
@@ -193,29 +79,13 @@ def _call_analytics(run, spec_name: str, table_name: str, spec_markdown: str,
     return result
 
 
-# ── persistence ──────────────────────────────────────────────────────────────
-
-def _write_insight(meta_client, spec_name: str, analysis: dict,
-                   seed_results: dict, trace_url: str) -> str:
+def _write_insight(meta_client, spec_name: str, analysis: dict, trace_url: str) -> str:
     insight_id = str(uuid.uuid4())
     known_issues_raw = analysis.get("related_known_issues", [])
     ki_serialized = [
         json.dumps(ki) if isinstance(ki, dict) else str(ki)
         for ki in known_issues_raw
     ]
-
-    # Store evidence as {llm: agent_evidence, chart_data: seed_rows} so the
-    # dashboard can render deterministic charts from ClickHouse result sets
-    # rather than trying to parse the LLM's free-text key_numbers strings.
-    chart_data = {
-        name: {"rows": r.get("rows", []), "n": r.get("n", 0)}
-        for name, r in seed_results.items()
-        if r.get("rows")
-    }
-    evidence_json = json.dumps({
-        "llm": analysis.get("evidence", {}),
-        "chart_data": chart_data,
-    })
 
     meta_client.insert(
         "insights",
@@ -224,74 +94,37 @@ def _write_insight(meta_client, spec_name: str, analysis: dict,
             analysis.get("title", ""),
             analysis.get("summary", ""),
             analysis.get("segment_cuts", []),
-            evidence_json,
+            json.dumps({"confidence_drivers": analysis.get("confidence_drivers", "")}),
             ki_serialized,
             float(analysis.get("confidence", 0.0)),
             trace_url,
+            analysis.get("report_html", ""),
         ]],
         column_names=["insight_id", "spec_name", "title", "summary",
                       "segment_cuts", "evidence", "related_known_issues",
-                      "confidence", "trace_url"],
+                      "confidence", "trace_url", "report_html"],
     )
     return insight_id
 
 
-# ── main entry point ─────────────────────────────────────────────────────────
-
 def run_analytics(run, spec_name: str, table_name: str, spec_markdown: str,
                   meta_client) -> dict | None:
-    """Full analytics loop: fetch context → run seed queries → call analytics
-    agent → persist insight. Returns the insight dict or None if agent unavailable."""
+    """Full analytics loop: call the analytics agent (which explores and queries
+    entirely on its own) → persist the insight + HTML report. Returns the insight
+    dict or None if the agent isn't configured."""
     agent_id = os.environ.get("LIBRECHAT_AGENT_ANALYTICS")
     if not agent_id:
         run.log(step="analytics_skipped", input=None,
                 output="LIBRECHAT_AGENT_ANALYTICS not set — skipping analytics")
         return None
 
-    with run.span("analytics_context"):
-        context = _fetch_context(table_name)
-        run.log(step="context_fetched", input=None,
-                output={"sections_found": list(context.keys()), "n_sections": len(context)})
-
-    seed_results = _run_seed_queries(run, table_name)
-
-    # Small-n check: surface it prominently so the agent gets the signal
-    sample_size_rows = seed_results.get("sample_size", {}).get("rows", [])
-    total_events = sum(r.get("n", 0) for r in sample_size_rows)
-    unique_users = max((r.get("unique_users", 0) for r in sample_size_rows), default=0)
+    total_events = _total_row_count(table_name)
     run.log(step="small_n_gate", input=None,
-            output={"total_events": total_events, "max_unique_users": unique_users,
-                    "sparse": total_events < 100})
+            output={"total_events": total_events, "sparse": total_events < 100})
 
-    # Log a plan span BEFORE the LLM call so a judge opening the trace sees
-    # what the agent decided to investigate and why — based on the seed results.
-    # This is derived from the seed data deterministically, not an extra LLM call.
-    sample_rows = seed_results.get("sample_size", {}).get("rows", [])
-    cvr_rows    = seed_results.get("feature_vs_baseline_cvr", {}).get("rows", [])
-    seg_rows    = seed_results.get("segment_breakdown", {}).get("rows", [])
-    plan_output = {
-        "event_types_found":   [r.get("event_type") for r in sample_rows[:8]],
-        "total_events":        total_events,
-        "unique_users":        unique_users,
-        "sparse":              total_events < 100,
-        "cohorts_to_compare":  [r.get("cohort") for r in cvr_rows],
-        "top_segments":        [
-            f"{r.get('device_type')}/{r.get('geoip_country_code')} (n={r.get('n')})"
-            for r in seg_rows[:5]
-        ],
-        "analysis_plan": (
-            "sparse table — will analyze relationship to existing funnel"
-            if total_events < 100
-            else "will compare feature vs standard conversion, then drill segment anomalies, then correlate with K1-K7"
-        ),
-    }
-    run.log(step="analytics_plan", input={"spec_name": spec_name, "table_name": table_name},
-            output=plan_output)
-
-    with run.span("analytics_interpret"):
+    with run.span("analytics_explore"):
         try:
-            analysis = _call_analytics(run, spec_name, table_name, spec_markdown,
-                                       seed_results, context)
+            analysis = _call_analytics(run, spec_name, table_name, spec_markdown)
         except AgentOutputError as e:
             run.log(step="analytics_json_error", input=e.raw_text[:1000], output=str(e.parse_error))
             return None
@@ -308,9 +141,11 @@ def run_analytics(run, spec_name: str, table_name: str, spec_markdown: str,
                 output={"total_events": total_events, "capped_to": 0.5})
 
     with run.span("analytics_persist"):
-        insight_id = _write_insight(meta_client, spec_name, analysis, seed_results, run.url)
+        insight_id = _write_insight(meta_client, spec_name, analysis, run.url)
         run.log(step="insight_written", input=None,
                 output={"insight_id": insight_id, "confidence": analysis.get("confidence"),
                         "title": analysis.get("title", "")[:120]})
 
-    return {**analysis, "insight_id": insight_id}
+    analysis["insight_id"] = insight_id
+    analysis["trace_url"] = run.url
+    return analysis

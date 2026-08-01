@@ -50,7 +50,7 @@ def create_agent(base_url: str, jwt: str, name: str, spec: dict) -> str:
             "description": spec["description"],
             "provider": "openAI",
             "model": MODEL,
-            "model_parameters": {"model": MODEL},
+            "model_parameters": {"model": MODEL, "response_format": {"type": "json_object"}},
             "instructions": spec["instructions"],
         },
     )

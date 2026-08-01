@@ -164,7 +164,7 @@ def run_perf_test(
     )
 
 
-def _parse_column_names(columns_ddl: str) -> list[str]:
+def parse_column_names(columns_ddl: str) -> list[str]:
     """Split top-level commas only (ignores commas inside e.g. Enum8('a'=1,'b'=2))."""
     parts, current, depth = [], [], 0
     for ch in columns_ddl:
@@ -184,7 +184,7 @@ def _parse_column_names(columns_ddl: str) -> list[str]:
 
 def _load_sample(client, scratch_table: str, columns_ddl: str, sample_source, sample_limit: int) -> int:
     if isinstance(sample_source, str):
-        cols = ", ".join(_parse_column_names(columns_ddl))
+        cols = ", ".join(parse_column_names(columns_ddl))
         client.command(
             f"INSERT INTO {scratch_table} ({cols}) "
             f"SELECT {cols} FROM {sample_source} LIMIT {sample_limit}"

@@ -1,0 +1,4 @@
+clickhouse-connect>=0.7
+langfuse>=2.36
+requests>=2.31
+python-dotenv>=1.0

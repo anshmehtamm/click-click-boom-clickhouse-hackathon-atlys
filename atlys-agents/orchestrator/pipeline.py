@@ -183,15 +183,43 @@ def _build_perf_query_patterns(columns_ddl: str) -> list[str]:
     return patterns
 
 
-def _log_agent_call(run, step: str, input_summary, result, **metadata):
+def _log_agent_call(run, step: str, input_data, result, **metadata):
     """Logs the call as a span with its own nested child span per tool call the agent
     actually made — so a judge opening the trace sees the real reasoning chain (which
     tools, what args, in what order), not one opaque call."""
     with run.span(step, **metadata) as span:
+        # Log the main LLM generation with full input/output and usage
+        run.log(
+            step=f"{step}_generation",
+            input=input_data,
+            output=result.output_text,  # Full output, not truncated
+            usage=result.usage if result.usage else None,
+            n_tool_calls=len(result.tool_calls)
+        )
+        # Log each tool call separately for detailed tracing
         for i, tc in enumerate(result.tool_calls):
-            run.log(step=f"tool_call[{i}]: {tc.get('name')}", input=tc.get("arguments"), output=tc.get("output"))
-        span_summary = {"final_output": result.output_text[:1500], "n_tool_calls": len(result.tool_calls)}
-    run.log(step=f"{step}_summary", input=input_summary, output=span_summary)
+            # Extract execution_time_ms from tool output if present (for ClickHouse queries)
+            tool_metadata = {}
+            tool_output = tc.get("output")
+            if tool_output:
+                try:
+                    # Tool output might be a JSON string or already parsed dict
+                    if isinstance(tool_output, str):
+                        output_dict = json.loads(tool_output)
+                    else:
+                        output_dict = tool_output
+
+                    if isinstance(output_dict, dict) and "execution_time_ms" in output_dict:
+                        tool_metadata["execution_time_ms"] = output_dict["execution_time_ms"]
+                except (json.JSONDecodeError, TypeError):
+                    pass  # Not JSON or not a dict, skip timing extraction
+
+            run.log(
+                step=f"{step}_tool[{i}]_{tc.get('name')}",
+                input=tc.get("arguments"),
+                output=tool_output,
+                **tool_metadata
+            )
 
 
 def _propose(run, spec_name: str, spec_markdown: str, sample_events: list[dict], prior_findings: list[dict] | None, previous_draft: dict | None) -> dict:
@@ -205,21 +233,21 @@ def _propose(run, spec_name: str, spec_markdown: str, sample_events: list[dict],
         payload["revise_to_address"] = prior_findings
         payload["previous_attempt"] = previous_draft
     result, r = _call_json_agent(os.environ["LIBRECHAT_AGENT_INSTRUMENTATION_PROPOSER"], payload)
-    _log_agent_call(run, "propose", {"spec_name": spec_name, "n_sample_events": len(sample_events)}, r)
+    _log_agent_call(run, "propose", payload, r, spec_name=spec_name)
     return result
 
 
 def _review(run, proposal: dict) -> dict:
     payload = {"proposal": proposal}
     result, r = _call_json_agent(os.environ["LIBRECHAT_AGENT_CONTEXT_REVIEWER"], payload)
-    _log_agent_call(run, "review", {"table_name": proposal.get("table_name")}, r)
+    _log_agent_call(run, "review", payload, r, table_name=proposal.get("table_name"))
     return result
 
 
 def _chronicle(run, executed_proposal: dict, spec_name: str) -> dict:
     payload = {"executed_proposal": executed_proposal, "spec_name": spec_name}
     result, r = _call_json_agent(os.environ["LIBRECHAT_AGENT_CONTEXT_CHRONICLER"], payload)
-    _log_agent_call(run, "chronicle", {"table_name": executed_proposal.get("table_name")}, r)
+    _log_agent_call(run, "chronicle", payload, r, table_name=executed_proposal.get("table_name"), spec_name=spec_name)
     return result
 
 

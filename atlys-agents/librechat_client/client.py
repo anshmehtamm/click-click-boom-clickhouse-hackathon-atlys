@@ -26,6 +26,7 @@ class AgentResult:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
     response_id: str | None = None
+    usage: dict[str, int] = field(default_factory=dict)
 
 
 def _base_url() -> str:
@@ -93,11 +94,23 @@ def call_agent(agent_id: str, input_text: str, previous_response_id: str | None 
                 if tc.get("call_id") == item.get("call_id"):
                     tc["output"] = item.get("output")
 
+    # Extract token usage from the response. Field names verified against a real
+    # captured response body, not OpenAI Chat Completions convention (which this
+    # isn't) — Open Responses uses input_tokens/output_tokens/total_tokens, not
+    # prompt_tokens/completion_tokens.
+    usage_data = data.get("usage", {})
+    usage = {
+        "input": usage_data.get("input_tokens", 0),
+        "output": usage_data.get("output_tokens", 0),
+        "total": usage_data.get("total_tokens", 0),
+    }
+
     return AgentResult(
         output_text="\n".join(output_text_parts).strip(),
         tool_calls=tool_calls,
         raw=data,
         response_id=data.get("id"),
+        usage=usage,
     )
 
 

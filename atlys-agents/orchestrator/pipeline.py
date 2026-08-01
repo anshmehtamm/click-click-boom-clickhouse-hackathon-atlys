@@ -813,26 +813,12 @@ def ingest_spec(
                 run.log(step="chronicle_json_error", input=e.raw_text[:1000], output=str(e.parse_error))
                 chronicle_ok = False
 
-        # Analytics: runs after chronicle so context_versions includes the new table.
-        # Non-fatal — a failed insight write never rolls back the executed schema.
-        insight_result = None
-        try:
-            from analytics.analytics_agent import run_analytics
-            insight_result = run_analytics(
-                run=run,
-                spec_name=spec_name,
-                table_name=final_proposal["table_name"],
-                spec_markdown=spec_markdown,
-                meta_client=meta_client,
-            )
-        except Exception as e:
-            run.log(step="analytics_error", input=None, output=str(e))
-
+        # Analytics agent is a separate, explicitly-triggered step (see
+        # analytics/analytics_agent.run_analytics / scripts/run_analytics_*.py)
+        # -- ingest_spec() no longer calls it automatically, so executing a
+        # schema never implicitly generates an insight.
         return {
             "status": "executed", "proposal_id": proposal_id, "table_name": final_proposal["table_name"],
             "ddl": final_proposal["ddl"], "revisions": revision, "regression_passed": regression.passed,
             "chronicle_ok": chronicle_ok, "trace_url": run.url,
-            "insight_title": insight_result.get("title") if insight_result else None,
-            "insight_confidence": insight_result.get("confidence") if insight_result else None,
-            "insight_id": insight_result.get("insight_id") if insight_result else None,
         }

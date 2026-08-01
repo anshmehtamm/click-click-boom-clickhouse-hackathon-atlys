@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { Plus, Lightbulb } from 'lucide-react';
+import { Plus } from 'lucide-react';
 import { openAgentPanel, openSpecHistory } from '@/lib/panel-context';
 import type { SpecSummary } from '../api/specs/route';
 
@@ -39,9 +39,9 @@ function ConfidenceCell({ value }: { value: number }) {
 
 // Column layout shared between header and body rows so everything lines up —
 // status is a fixed-width dot+label, name/table share the flexible middle,
-// confidence/insight/time are fixed-width and right-leaning (scannable,
-// like a file manager or job queue, not a card grid).
-const GRID_COLS = '96px minmax(0,1.3fr) minmax(0,1fr) 84px minmax(0,1.4fr) 92px';
+// confidence/time are fixed-width and right-leaning (scannable, like a file
+// manager or job queue, not a card grid).
+const GRID_COLS = '96px minmax(0,1.3fr) minmax(0,1fr) 84px 92px';
 
 function SpecRow({ spec }: { spec: SpecSummary }) {
   return (
@@ -61,17 +61,6 @@ function SpecRow({ spec }: { spec: SpecSummary }) {
       </span>
 
       <ConfidenceCell value={spec.latest_confidence} />
-
-      <span className="flex items-center gap-1.5 min-w-0 text-[12px] truncate" style={{ color: '#7a7068' }}>
-        {spec.has_insight > 0 && spec.insight_title ? (
-          <>
-            <Lightbulb className="h-3 w-3 flex-shrink-0" style={{ color: '#d97706' }} />
-            <span className="italic truncate">{spec.insight_title}</span>
-          </>
-        ) : (
-          <span style={{ color: '#c0b8b0' }}>—</span>
-        )}
-      </span>
 
       <span className="text-[11px] font-mono tabular-nums text-right" style={{ color: '#c0b8b0' }}>
         {spec.last_run.slice(5, 16).replace('T', ' ')}
@@ -151,9 +140,9 @@ export default function SpecsPage() {
             {/* Column headers */}
             <div className="grid items-center gap-4 px-4 py-2 border-b"
               style={{ gridTemplateColumns: GRID_COLS, borderColor: '#e5dfd6', backgroundColor: '#faf8f5' }}>
-              {['Status', 'Spec', 'Table', 'Conf.', 'Insight', 'Last run'].map((h, i) => (
+              {['Status', 'Spec', 'Table', 'Conf.', 'Last run'].map((h, i) => (
                 <span key={h}
-                  className={`text-[9.5px] font-bold uppercase tracking-widest ${i === 5 ? 'text-right' : ''}`}
+                  className={`text-[9.5px] font-bold uppercase tracking-widest ${i === 4 ? 'text-right' : ''}`}
                   style={{ color: '#9c9088' }}>
                   {h}
                 </span>

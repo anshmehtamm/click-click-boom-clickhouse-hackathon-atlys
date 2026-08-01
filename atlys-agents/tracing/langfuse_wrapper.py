@@ -59,7 +59,7 @@ class Run:
     def url(self) -> str:
         return self._client.get_trace_url(trace_id=self._root_span.trace_id)
 
-    def log(self, step: str, input=None, output=None, reasoning: str = None, **metadata):
+    def log(self, step: str, input=None, output=None, reasoning: str = None, usage: dict = None, **metadata):
         """One-shot child span for a single call/decision with no sub-steps of its own."""
         meta = dict(metadata)
         if reasoning is not None:
@@ -74,9 +74,21 @@ class Run:
             **meta
         )
 
-        with self._client.start_as_current_observation(
-            name=step, as_type="span", input=input, output=output, metadata=meta or None
-        ):
+        # Use "generation" type if usage data is provided (LLM call), otherwise "span"
+        observation_type = "generation" if usage else "span"
+        kwargs = {
+            "name": step,
+            "as_type": observation_type,
+            "input": input,
+            "output": output,
+            "metadata": meta or None,
+        }
+        if usage:
+            # Langfuse v4 expects usage_details parameter (not "usage")
+            # The format should match: {input: int, output: int, total: int}
+            kwargs["usage_details"] = usage
+
+        with self._client.start_as_current_observation(**kwargs):
             pass
 
     @contextlib.contextmanager

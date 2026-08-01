@@ -25,6 +25,7 @@ class AgentResult:
     output_text: str
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
+    usage: dict[str, int] = field(default_factory=dict)
 
 
 def _base_url() -> str:
@@ -71,10 +72,19 @@ def call_agent(agent_id: str, input_text: str, timeout: int = 120) -> AgentResul
                 if tc.get("call_id") == item.get("call_id"):
                     tc["output"] = item.get("output")
 
+    # Extract token usage from the response
+    usage_data = data.get("usage", {})
+    usage = {
+        "input": usage_data.get("prompt_tokens", 0),
+        "output": usage_data.get("completion_tokens", 0),
+        "total": usage_data.get("total_tokens", 0),
+    }
+
     return AgentResult(
         output_text="\n".join(output_text_parts).strip(),
         tool_calls=tool_calls,
         raw=data,
+        usage=usage,
     )
 
 

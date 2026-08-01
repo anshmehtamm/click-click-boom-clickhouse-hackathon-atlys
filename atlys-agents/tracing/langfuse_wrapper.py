@@ -46,10 +46,14 @@ _clickstack_initialized = False
 
 def _step_kind(step: str) -> str:
     """Classifies a step name for the dashboard's UI (icon/color per row), purely
-    cosmetic — matches the naming convention orchestrator/pipeline.py's
-    _log_agent_call already uses (`{step}_generation`, `{step}_tool[i]_{name}`)."""
+    cosmetic — matches the naming convention orchestrator/agent_io.py's
+    _call_json_agent already uses (`{step}_generation`, `{step}_tool[i]_{name}`,
+    `{step}_reasoning[turnN]` — the last logged LIVE per turn during the
+    tool-calling loop, not batched at the end)."""
     if "_tool[" in step:
         return "tool_call"
+    if "_reasoning[" in step:
+        return "reasoning"
     if step.endswith("_generation"):
         return "generation"
     return "log"

@@ -18,7 +18,7 @@ import uuid
 from collections import Counter
 
 from agent_meta.db import get_client
-from orchestrator.agent_io import AgentOutputError, _call_json_agent, _log_agent_call, _extract_json
+from orchestrator.agent_io import AgentOutputError, _call_json_agent, _extract_json
 from perf_tool import AllCandidatesFailedError, Candidate, run_perf_test
 from test_harness import build_smoke_queries, register_tests, run_new_table_tests, run_regression_suite
 from tracing import traced_run
@@ -42,7 +42,7 @@ SCRATCH_DIR.mkdir(exist_ok=True)
 MAX_REVISIONS = 4
 
 
-# AgentOutputError, _extract_json, _call_json_agent, _log_agent_call now live in
+# AgentOutputError, _extract_json, _call_json_agent now live in
 # orchestrator/agent_io.py so analytics_agent.py can import them without creating
 # a circular dependency (pipeline lazily imports analytics_agent at call time).
 
@@ -167,9 +167,6 @@ def _build_perf_query_patterns(columns_ddl: str) -> list[str]:
     return patterns
 
 
-# _log_agent_call moved to orchestrator/agent_io.py
-
-
 def _record_findings(history: list[dict], new_findings: list[dict], round_num: int) -> list[dict]:
     """Tags new findings with the round they surfaced in and appends to the running
     history (in place), returning it for convenience at the call site."""
@@ -223,29 +220,49 @@ def _propose(run, spec_name: str, spec_markdown: str, sample_scratch_info: dict,
         # thing that was wrong, which risks introducing a NEW issue elsewhere.
         payload["revise_to_address"] = prior_findings[-MAX_FINDINGS_IN_PAYLOAD:]
         payload["previous_attempt"] = previous_draft
-    result, r = _call_json_agent(os.environ["LIBRECHAT_AGENT_INSTRUMENTATION_PROPOSER"], payload)
-    _log_agent_call(run, "propose", payload, r, reasoning=result.get("rationale"), spec_name=spec_name)
+    result, _r = _call_json_agent(
+        "instrumentation_proposer", payload, run, "propose",
+        required_keys=[
+            "table_name", "columns_ddl", "ordering_key_candidates", "column_mapping",
+            "materialized_views", "confidence", "rationale",
+        ],
+        reasoning_fn=lambda parsed: parsed.get("rationale"),
+        spec_name=spec_name,
+    )
     return result
 
 
 def _review(run, proposal: dict) -> dict:
     payload = {"proposal": proposal}
-    result, r = _call_json_agent(os.environ["LIBRECHAT_AGENT_CONTEXT_REVIEWER"], payload)
-    findings_summary = "; ".join(
-        f"[{f.get('severity')}] {f.get('description')}" for f in result.get("findings", [])
+
+    def _reasoning(parsed: dict) -> str:
+        findings_summary = "; ".join(
+            f"[{f.get('severity')}] {f.get('description')}" for f in parsed.get("findings", [])
+        )
+        return f"{parsed.get('verdict', '?')}" + (f" — {findings_summary}" if findings_summary else "")
+
+    result, _r = _call_json_agent(
+        "context_reviewer", payload, run, "review",
+        required_keys=["verdict", "findings"], reasoning_fn=_reasoning,
+        table_name=proposal.get("table_name"),
     )
-    reasoning = f"{result.get('verdict', '?')}" + (f" — {findings_summary}" if findings_summary else "")
-    _log_agent_call(run, "review", payload, r, reasoning=reasoning, table_name=proposal.get("table_name"))
     return result
 
 
 def _chronicle(run, executed_proposal: dict, spec_name: str) -> dict:
     payload = {"executed_proposal": executed_proposal, "spec_name": spec_name}
-    result, r = _call_json_agent(os.environ["LIBRECHAT_AGENT_CONTEXT_CHRONICLER"], payload)
-    sections_summary = "; ".join(
-        f"{s.get('section')}: {s.get('diff_summary')}" for s in result.get("sections", [])
+
+    def _reasoning(parsed: dict) -> str | None:
+        summary = "; ".join(
+            f"{s.get('section')}: {s.get('diff_summary')}" for s in parsed.get("sections", [])
+        )
+        return summary or None
+
+    result, _r = _call_json_agent(
+        "context_chronicler", payload, run, "chronicle",
+        required_keys=["sections"], reasoning_fn=_reasoning,
+        table_name=executed_proposal.get("table_name"), spec_name=spec_name,
     )
-    _log_agent_call(run, "chronicle", payload, r, reasoning=sections_summary or None, table_name=executed_proposal.get("table_name"), spec_name=spec_name)
     return result
 
 
@@ -305,19 +322,73 @@ def ingest_spec(
                     "suggested_fix": "Output ONLY a single JSON object matching the schema — no markdown fences, no prose, no truncation.",
                 }], revision)
                 continue
+
+            # Defensive normalization: the schema says columns_ddl is "column
+            # definitions only... no ENGINE/ORDER BY" (i.e. no surrounding
+            # parens either), but a real run wrapped it in an extra outer `(...)`
+            # anyway -- every consumer (perf_tool, test_harness, execute) already
+            # wraps it in `CREATE TABLE x (...)`, so a self-added outer paren
+            # produces `((...))`  and a syntax error at the very first column.
+            # Strip it here, once, rather than trusting every downstream
+            # CREATE-statement builder to defend against it independently.
+            cols = draft.get("columns_ddl", "").strip()
+            if cols.startswith("(") and cols.endswith(")"):
+                draft["columns_ddl"] = cols[1:-1].strip()
+
             previous_draft = draft
             # full_events, not sample_events: perf test, test harness (whose
             # insert_integrity check compares landed-row-count to len(sample_rows) —
             # this IS the completeness gate now, for free) and the real production
             # INSERT must all see the same real, complete dataset the proposer only
             # saw a small stratified slice of.
-            flattened_events = _flatten_events(full_events, draft.get("column_mapping", {}))
+            #
+            # Same failure class as ordering_key_candidates/materialized_views above
+            # (valid top-level JSON, malformed nested value -- a real run had a
+            # column_mapping VALUE that was itself a dict instead of a plain column
+            # name string, which crashed as "unhashable type: 'dict'" trying to use
+            # it as a dict key). This has now shown up in three independent nested
+            # fields across real runs, so the pattern is: don't try to enumerate
+            # every possible way a field can be malformed in advance -- catch the
+            # structural error where it actually happens and feed it back.
+            try:
+                flattened_events = _flatten_events(full_events, draft.get("column_mapping", {}))
+            except (KeyError, TypeError, AttributeError) as e:
+                run.log(step="propose_malformed_column_mapping", input=draft.get("column_mapping"), output=str(e))
+                if revision >= MAX_REVISIONS:
+                    raise
+                revision += 1
+                prior_findings = _record_findings(finding_history, [{
+                    "severity": "block", "category": "invalid_json",
+                    "description": f"column_mapping is malformed ({e}). It must be a flat {{raw_field_or_event: column_name}} mapping — every value must be a plain string column name, not a nested object.",
+                    "suggested_fix": "Fix column_mapping so every value is a simple string (the target column name), not a dict/list.",
+                }], revision)
+                continue
 
             with run.span("perf_evaluation", revision=revision):
-                candidates = [
-                    Candidate(label=c["label"], ordering_key=c["ordering_key"], partition_key=c.get("partition_key", "toYYYYMM(timestamp)"))
-                    for c in draft["ordering_key_candidates"]
-                ]
+                # Top-level required_keys (checked in _call_json_agent) doesn't
+                # reach into list-item structure -- ordering_key_candidates can be
+                # present but contain items missing their OWN required keys (seen
+                # on a real run: valid top-level JSON, but a candidate item
+                # missing "label"). Same failure class as AgentOutputError above,
+                # same treatment: bounded feedback into the rework loop, not a
+                # crash, rather than trying to exhaustively schema-validate every
+                # nested structure in Python.
+                try:
+                    candidates = [
+                        Candidate(label=c["label"], ordering_key=c["ordering_key"], partition_key=c.get("partition_key", "toYYYYMM(timestamp)"))
+                        for c in draft["ordering_key_candidates"]
+                    ]
+                except (KeyError, TypeError) as e:
+                    run.log(step="propose_malformed_candidates", input=draft.get("ordering_key_candidates"), output=str(e))
+                    if revision >= MAX_REVISIONS:
+                        raise
+                    revision += 1
+                    prior_findings = _record_findings(finding_history, [{
+                        "severity": "block", "category": "invalid_json",
+                        "description": f"ordering_key_candidates items are malformed ({e}). Each item needs exactly: label, ordering_key, partition_key (optional).",
+                        "suggested_fix": "Fix the ordering_key_candidates array so every item has 'label' and 'ordering_key' as string keys — check for typos/missing fields in each candidate object.",
+                    }], revision)
+                    continue
                 try:
                     perf_report = run_perf_test(
                         table_name=draft["table_name"],
@@ -344,19 +415,58 @@ def ingest_spec(
                     }], revision)
                     continue
                 winner = next(c for c in candidates if c.label == perf_report.winner) if perf_report.winner != "baseline_legacy" else candidates[0]
-                run.log(step="perf_winner", input=[c.label for c in candidates], output={"winner": winner.label, "speedup": perf_report.speedup_vs_baseline})
+                # Full report (every candidate's real timings/rows-read/bytes-read,
+                # not just the winner) -- perf_report.to_json() already has this,
+                # it just wasn't being logged. This IS the evidence the ordering
+                # key decision is based on; a UI showing this needs the real
+                # comparison, not just the final answer.
+                # json.loads(perf_report.to_json()) not [c.__dict__ ...]: candidates
+                # contain nested QueryTiming dataclass objects, not JSON-serializable
+                # directly -- to_json() already has the recursive dataclass->dict
+                # handling (same method _write_proposal uses), reused here rather
+                # than duplicating it.
+                run.log(
+                    step="perf_winner",
+                    input=[c.label for c in candidates],
+                    output=json.loads(perf_report.to_json()),
+                )
 
             ddl = (
                 f"CREATE TABLE {draft['table_name']} ({draft['columns_ddl']}) "
                 f"ENGINE = MergeTree PARTITION BY {winner.partition_key} ORDER BY {winner.ordering_key}"
             )
+            # Same failure class as ordering_key_candidates above (valid top-level
+            # JSON, malformed nested item — a real run hit test_harness.py's
+            # `mv["ddl"]` KeyError on an MV item missing that key) — checked ONCE
+            # here rather than defended against separately in both call sites that
+            # use materialized_views (ddl_syntax_check pre-review AND the full
+            # test_harness post-review), and before either wastes a scratch round
+            # trip on a proposal we already know is malformed.
+            mvs = draft.get("materialized_views", [])
+            bad_mvs = [i for i, mv in enumerate(mvs) if not isinstance(mv, dict) or "name" not in mv or "ddl" not in mv]
+            if bad_mvs:
+                run.log(step="propose_malformed_mvs", input=mvs, output=f"items missing name/ddl at index {bad_mvs}")
+                if revision >= MAX_REVISIONS:
+                    raise ValueError(f"materialized_views items at index {bad_mvs} missing required 'name'/'ddl' keys, revision cap reached")
+                revision += 1
+                prior_findings = _record_findings(finding_history, [{
+                    "severity": "block", "category": "invalid_json",
+                    "description": f"materialized_views item(s) at index {bad_mvs} are missing 'name' and/or 'ddl'. Every MV needs both.",
+                    "suggested_fix": "Fix the materialized_views array so every item has 'name' (string) and 'ddl' (the full CREATE MATERIALIZED VIEW statement) as keys.",
+                }], revision)
+                continue
+
             proposal = {
                 "table_name": draft["table_name"], "columns_ddl": draft["columns_ddl"], "ddl": ddl,
                 "ordering_key": winner.ordering_key,
                 "partition_key": winner.partition_key, "column_mapping": draft.get("column_mapping", {}),
-                "materialized_views": draft.get("materialized_views", []),
+                "materialized_views": mvs,
                 "confidence": draft.get("confidence", 0.5),
-                "rationale": draft.get("rationale", "") + f" | ordering key chosen by perf_tool: {perf_report.speedup_vs_baseline}x vs legacy baseline.",
+                # _as_text: a real run returned rationale as a list of bullet
+                # strings instead of one string (schema says string) -- unlike
+                # the malformed-structure cases above, this is benign and cheaply
+                # normalizable (join the bullets), not worth burning a revision on.
+                "rationale": _as_text(draft.get("rationale", "")) + f" | ordering key chosen by perf_tool: {perf_report.speedup_vs_baseline}x vs legacy baseline.",
             }
 
             # DDL syntax gate — runs BEFORE review, not after. Reviewer LLM calls and

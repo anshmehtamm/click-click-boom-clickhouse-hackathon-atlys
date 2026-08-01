@@ -11,6 +11,7 @@ Never touches production tables (`atlys.*`); everything happens in `atlys_stagin
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -19,6 +20,17 @@ from typing import Any
 from agent_meta.db import get_client
 
 LEGACY_ORDERING_KEY = "(id, timestamp, user_id)"
+
+
+def _safe_identifier_fragment(text: str, max_len: int = 40) -> str:
+    """A candidate's `label` is documented as "short_label" in the proposer's
+    schema, but nothing enforces that -- a real run put a full descriptive
+    sentence there instead, which went straight into a scratch table name
+    unsanitized and broke with a SQL syntax error (spaces/colons aren't valid in
+    an identifier). Never trust LLM output as a raw SQL identifier fragment,
+    same principle as everywhere else names get built from agent output."""
+    slug = re.sub(r"[^a-zA-Z0-9_]+", "_", text).strip("_")
+    return slug[:max_len] or "candidate"
 
 
 @dataclass
@@ -110,7 +122,7 @@ def run_perf_test(
     reports: list[CandidateReport] = []
     errors: dict[str, str] = {}
     for cand in all_candidates:
-        scratch_table = f"{scratch_db}.{table_name}__{cand.label}__{uuid.uuid4().hex[:6]}"
+        scratch_table = f"{scratch_db}.{table_name}__{_safe_identifier_fragment(cand.label)}__{uuid.uuid4().hex[:6]}"
         try:
             client.command(f"DROP TABLE IF EXISTS {scratch_table}")
             client.command(

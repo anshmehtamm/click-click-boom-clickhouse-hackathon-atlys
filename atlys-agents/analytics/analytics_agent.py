@@ -36,7 +36,7 @@ from agent_meta.db import get_client
 # Import shared agent helpers from their own module to avoid a circular import
 # (pipeline.py lazily imports analytics_agent; analytics_agent must not import
 # pipeline at module load time or the cycle breaks when the lazy import is hoisted).
-from orchestrator.agent_io import AgentOutputError, _call_json_agent, _log_agent_call
+from orchestrator.agent_io import AgentOutputError, _call_json_agent
 
 
 def _total_row_count(table_name: str) -> int:
@@ -74,8 +74,12 @@ def _call_analytics(run, spec_name: str, table_name: str, spec_markdown: str) ->
             "correlate with known issues, then write the full HTML report."
         ),
     }
-    result, r = _call_json_agent(os.environ["LIBRECHAT_AGENT_ANALYTICS"], payload)
-    _log_agent_call(run, "analytics", payload, r, spec_name=spec_name, table_name=table_name)
+    result, _r = _call_json_agent(
+        "analytics_agent", payload, run, "analytics",
+        required_keys=["title", "summary", "confidence", "report_html"],
+        reasoning_fn=lambda parsed: parsed.get("summary"),
+        spec_name=spec_name, table_name=table_name,
+    )
     return result
 
 
@@ -112,10 +116,9 @@ def run_analytics(run, spec_name: str, table_name: str, spec_markdown: str,
     """Full analytics loop: call the analytics agent (which explores and queries
     entirely on its own) → persist the insight + HTML report. Returns the insight
     dict or None if the agent isn't configured."""
-    agent_id = os.environ.get("LIBRECHAT_AGENT_ANALYTICS")
-    if not agent_id:
+    if not os.environ.get("OPENAI_API_KEY"):
         run.log(step="analytics_skipped", input=None,
-                output="LIBRECHAT_AGENT_ANALYTICS not set — skipping analytics")
+                output="OPENAI_API_KEY not set — skipping analytics")
         return None
 
     total_events = _total_row_count(table_name)

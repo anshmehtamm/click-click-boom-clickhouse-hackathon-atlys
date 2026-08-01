@@ -52,6 +52,10 @@ deliberate, not exhaustive:
   reliable than eyeballing individual lines via grep_scratch/read_scratch for
   anything beyond a quick spot-check.
 Call list_context_sections early — don't skip straight to guessing section keys.
+If you have skills attached: call list_skill_files(skill_name) before
+read_skill_file if you're not 100% sure of an exact filename — guessing rule
+filenames wastes calls on files that don't exist (a real skill's rules/
+directory has dozens of files; don't assume a name pattern, list it).
 Stop calling tools once you have what you need; don't pad the trace with queries
 that don't change your answer. Your final message must be ONLY the JSON output.
 """.strip()
@@ -75,6 +79,28 @@ pandas (`pd.read_json('<scratch_file>', lines=True)`, then check `.dtypes`,
 shapes/nesting from the event_type_counts alone — that's just enough to know what
 event types exist, not what their fields look like.
 
+`execute_python` and `run_query` answer DIFFERENT questions — don't substitute one
+for the other:
+- `execute_python` only ever sees the scratch file — this NEW feature's own small
+  sample. It can tell you about the new data's own shape/fields/nesting, and
+  nothing else. It cannot tell you anything about `application_started`,
+  `purchase_completed`, or any other EXISTING table.
+- `run_query` hits real ClickHouse. Any claim about an existing table — whether a
+  join key actually overlaps, what real values in a column look like, how many
+  rows exist — MUST be backed by an actual `run_query` result against that real
+  table, not inferred from the sample alone. "I checked the sample and it looks
+  plausible" is not verification of a cross-table join; querying the real table is.
+
+This is a hackathon build working with sample datasets (thousands of rows, not a
+production system at scale) — favor the simplest correct design. Reach for
+`clickhouse-best-practices` to catch real correctness bugs (a Nullable ORDER BY
+column, a type-nesting error — things that would fail outright), not as a checklist
+to exhaustively production-harden a demo table. A REFRESH-based MV, elaborate
+normalization, or a design justified mainly by "the skill recommends it" is worth a
+second look if a simpler trigger-based table/MV answers the same PM question
+correctly — sophistication that isn't load-bearing for THIS spec's actual questions
+is just more surface area to get wrong, not a sign of quality.
+
 You have access to the `clickhouse-best-practices` skill (official ClickHouse Agent
 Skills — 31 rules on schema design, types, JOINs, materialized views). Use it before
 proposing: check `rules/schema-types-avoid-nullable.md`,
@@ -82,7 +108,8 @@ proposing: check `rules/schema-types-avoid-nullable.md`,
 minimum, and cite the specific rule name in your rationale when it drove a decision
 (e.g. "Per schema-types-avoid-nullable, ..."). This encodes real, validated
 ClickHouse-specific behavior — prefer it over general database intuition when they
-disagree.
+disagree, but it's a correctness reference, not a mandate to use every rule it
+describes.
 
 You also have the `context-engine` skill — load it before proposing to check the
 existing category taxonomy, the confidence-calibration scale, and known gotchas
@@ -232,6 +259,15 @@ Design rules:
 - confidence (0-1): based on how directly the raw NDJSON sample supports your typing
   choices, and what fraction of raw fields you could cleanly map.
 
+Explore with your tools as much as you actually need — but once you're done
+exploring, your VERY NEXT message must be the JSON object below and NOTHING
+else. Not a markdown-formatted "measurement plan" with prose and SQL blocks
+explaining your approach — that's a real failure mode seen on a live run after
+extensive tool exploration, and it crashes the pipeline (this schema is
+consumed by code, not read by a person). Every design decision, every SQL
+example, every piece of reasoning belongs in `rationale`/`materialized_views[].ddl`
+inside the JSON — not as prose around it.
+
 Output ONLY this JSON object:
 {{
   "table_name": "string, snake_case",
@@ -273,6 +309,13 @@ LowCardinality misuse, missed low-cardinality-first key ordering, etc. — and r
 This is a real, validated source of ClickHouse-specific correctness, not a style
 opinion — treat a clear rule violation as at least `warn`, `block` if it would cause
 an actual execution failure (e.g. Nullable in ORDER BY without allow_nullable_key).
+That said: this is a hackathon build over sample datasets, not a production system
+at scale — `block` a rule violation because it would actually break or mislead, not
+because a simpler design leaves some best-practice optimization on the table. Don't
+manufacture `best_practice_violation` findings against a proposal that correctly
+answers the spec's PM questions just because a more elaborate design could
+theoretically score higher against the skill's full checklist — that trades real
+progress for revision churn without making the answer any more correct.
 
 {TOOLS_NOTE}
 

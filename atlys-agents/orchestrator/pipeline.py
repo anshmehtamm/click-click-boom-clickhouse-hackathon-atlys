@@ -12,13 +12,27 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import uuid
+from collections import Counter
 
 from agent_meta.db import get_client
 from librechat_client import call_agent
 from perf_tool import AllCandidatesFailedError, Candidate, run_perf_test
 from test_harness import build_smoke_queries, register_tests, run_new_table_tests, run_regression_suite
 from tracing import traced_run
+
+# Same directory mcp_servers/data_tools_server.py uses for run_query's scratch
+# offload (both processes run on the host, not in LibreChat's Docker container, so
+# they share this filesystem path directly) — sample_events gets written here
+# instead of embedded inline in the propose payload. Measured: 150 sample events
+# serialize to ~66K characters (~16-20K tokens), which used to get resent verbatim
+# on every propose call including every rework round, dwarfing everything else in
+# the payload combined. The proposer now reads it via grep_scratch/read_scratch or
+# execute_python (pandas) instead — same lean-tool pattern already used for large
+# run_query results, applied to the proposer's own input this time.
+SCRATCH_DIR = pathlib.Path(__file__).resolve().parent.parent / ".tool_scratch"
+SCRATCH_DIR.mkdir(exist_ok=True)
 
 # Shared budget across review rework, test-harness failures, AND execute failures
 # (all three now feed back into the same propose->review->test->execute loop) —
@@ -247,15 +261,50 @@ def _record_findings(history: list[dict], new_findings: list[dict], round_num: i
     return history
 
 
-def _propose(run, spec_name: str, spec_markdown: str, sample_events: list[dict], prior_findings: list[dict] | None, previous_draft: dict | None) -> dict:
-    payload = {"spec_markdown": spec_markdown, "sample_events": sample_events}
+# Cap on how many accumulated findings get sent to the proposer, most-recent-first —
+# a safety bound on finding_history's growth (measured: 3.3K chars round 1 -> 9.5K
+# chars round 4 on a real run). Small next to the sample_events fix below, but
+# unbounded growth across a long rework chain is still worth capping cheaply.
+MAX_FINDINGS_IN_PAYLOAD = 8
+
+
+def _write_sample_scratch_file(sample_events: list[dict]) -> dict:
+    """Writes sample_events as NDJSON to the shared scratch dir instead of embedding
+    them inline — same offload pattern data_tools_server.py already uses for large
+    run_query results, applied here to the proposer's own input. Returns a small
+    pointer object (filename + counts) that costs a few hundred chars instead of the
+    ~66K chars 150 raw events serialize to. execute_python's subprocess runs with
+    cwd=SCRATCH_DIR (see mcp_servers/data_tools_server.py), so the proposer can do
+    `pd.read_json('<filename>', lines=True)` with just the bare filename."""
+    filename = f"sample_events_{uuid.uuid4().hex[:8]}.ndjson"
+    (SCRATCH_DIR / filename).write_text(
+        "\n".join(json.dumps(e, default=str) for e in sample_events)
+    )
+    counts = Counter(e.get("event", "unknown") for e in sample_events)
+    return {
+        "scratch_file": filename,
+        "n_events": len(sample_events),
+        "event_type_counts": dict(counts),
+    }
+
+
+def _propose(run, spec_name: str, spec_markdown: str, sample_scratch_info: dict, prior_findings: list[dict] | None, previous_draft: dict | None) -> dict:
+    # sample_scratch_info is a small pointer (filename + counts), never the raw
+    # events — computed once in ingest_spec via _write_sample_scratch_file, same
+    # every round. Measured: 150 raw events serialize to ~66K characters (~16-20K
+    # tokens); embedding that inline on every propose call used to dwarf everything
+    # else in the payload combined. The proposer inspects the scratch file on demand
+    # via grep_scratch/read_scratch or execute_python (pandas) instead — same
+    # lean-tool pattern as any other large tool result, applied to the agent's own
+    # input this time.
+    payload = {"spec_markdown": spec_markdown, "sample_events": sample_scratch_info}
     if prior_findings:
         # previous_draft matters as much as the findings: each call to this agent
         # is a fresh conversation with no memory of its own prior output (no
         # previous_response_id chaining), so without the actual previous DDL/MVs it
         # can only regenerate blind — re-guessing everything, not patching the one
         # thing that was wrong, which risks introducing a NEW issue elsewhere.
-        payload["revise_to_address"] = prior_findings
+        payload["revise_to_address"] = prior_findings[-MAX_FINDINGS_IN_PAYLOAD:]
         payload["previous_attempt"] = previous_draft
     result, r = _call_json_agent(os.environ["LIBRECHAT_AGENT_INSTRUMENTATION_PROPOSER"], payload)
     _log_agent_call(run, "propose", payload, r, reasoning=result.get("rationale"), spec_name=spec_name)
@@ -303,6 +352,7 @@ def ingest_spec(
     """
     meta_client = get_client(database="agent_meta")
     full_events = full_events if full_events is not None else sample_events
+    sample_scratch_info = _write_sample_scratch_file(sample_events)
 
     with traced_run(agent="pipeline", spec=spec_name) as run:
         revision = 0
@@ -323,7 +373,7 @@ def ingest_spec(
 
         while True:
             try:
-                draft = _propose(run, spec_name, spec_markdown, sample_events, prior_findings, previous_draft)
+                draft = _propose(run, spec_name, spec_markdown, sample_scratch_info, prior_findings, previous_draft)
             except AgentOutputError as e:
                 # _call_json_agent already retried once internally; this means
                 # it failed twice in a row. Treat like any other failure mode —

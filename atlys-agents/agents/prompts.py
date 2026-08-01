@@ -43,6 +43,14 @@ deliberate, not exhaustive:
   the rest — use those instead of re-running or widening the query to "just see it
   all." Prefer aggregate queries (GROUP BY/count/uniq) over row dumps in the first
   place; add your own LIMIT for exploratory SELECTs.
+- execute_python(code) — sandboxed, pandas-only (no other imports work, enforced not
+  just requested), runs with its working directory set to the scratch dir, so any
+  scratch filename (from run_query, or from a `scratch_file` pointer given directly
+  in your input) can be opened with just its bare name, e.g.
+  `pd.read_json('sample_events_ab12cd34.ndjson', lines=True)`. Use this to explore
+  real field shapes/nesting/dtypes across a whole sample at once — faster and more
+  reliable than eyeballing individual lines via grep_scratch/read_scratch for
+  anything beyond a quick spot-check.
 Call list_context_sections early — don't skip straight to guessing section keys.
 Stop calling tools once you have what you need; don't pad the trace with queries
 that don't change your answer. Your final message must be ONLY the JSON output.
@@ -50,12 +58,22 @@ that don't change your answer. Your final message must be ONLY the JSON output.
 
 INSTRUMENTATION_PROPOSER = f"""
 You are the Instrumentation Agent's proposer for Atlys, a visa-application platform.
-Given a new feature spec (product brief + a sample of raw NDJSON events), you design
-a ClickHouse table schema. You do NOT pick the final ordering key yourself — that
-decision is made deterministically afterward by an actual performance test the
-orchestrator runs against your candidates (perf_tool), because "the LLM asserted it's
-faster" is not evidence. Your job is columns, typing, the one-table-vs-many-tables
-call, and 2-3 real ordering-key CANDIDATES worth testing.
+Given a new feature spec (product brief + a pointer to a sample of raw NDJSON
+events), you design a ClickHouse table schema. You do NOT pick the final ordering key
+yourself — that decision is made deterministically afterward by an actual
+performance test the orchestrator runs against your candidates (perf_tool), because
+"the LLM asserted it's faster" is not evidence. Your job is columns, typing, the
+one-table-vs-many-tables call, and 2-3 real ordering-key CANDIDATES worth testing.
+
+`sample_events` in your input is NOT the raw events — it's a pointer object
+(`{{"scratch_file": "...", "n_events": N, "event_type_counts": {{...}}}}`). The
+actual NDJSON lives at that filename in the scratch dir. Before designing
+columns_ddl/column_mapping, actually inspect it — either `execute_python` with
+pandas (`pd.read_json('<scratch_file>', lines=True)`, then check `.dtypes`,
+`.head()`, nested-field shapes per event type) for a full-sample view, or
+`read_scratch`/`grep_scratch` for a targeted spot-check. Don't guess field
+shapes/nesting from the event_type_counts alone — that's just enough to know what
+event types exist, not what their fields look like.
 
 You have access to the `clickhouse-best-practices` skill (official ClickHouse Agent
 Skills — 31 rules on schema design, types, JOINs, materialized views). Use it before
@@ -437,16 +455,19 @@ _CLICKHOUSE_TOOLS = [
     "list_tables_mcp_atlys_data", "describe_table_mcp_atlys_data", "run_query_mcp_atlys_data",
     "grep_scratch_mcp_atlys_data", "read_scratch_mcp_atlys_data",
 ]
-# execute_python only where genuinely useful (analytics — post-processing an
-# aggregate) — not on the schema/review/chronicle agents, which have no reason to
-# run arbitrary code and shouldn't be tempted to.
+# execute_python where genuinely useful: analytics (post-processing an aggregate)
+# and the instrumentation proposer (inspecting its sample_events scratch file's real
+# field shapes/nesting/types via pandas, since sample_events is never embedded
+# inline in the payload — see _write_sample_scratch_file in orchestrator/pipeline.py).
+# Not on review/chronicle, which have no reason to run arbitrary code and shouldn't
+# be tempted to.
 _PYTHON_TOOL = ["execute_python_mcp_atlys_data"]
 
 AGENTS = {
     "instrumentation_proposer": {
         "instructions": INSTRUMENTATION_PROPOSER,
         "description": "Proposes ClickHouse table DDL from a feature spec + pre-computed perf results.",
-        "tools": _CONTEXT_TOOLS + _CLICKHOUSE_TOOLS,
+        "tools": _CONTEXT_TOOLS + _CLICKHOUSE_TOOLS + _PYTHON_TOOL,
         "skills_enabled": True,  # ClickHouse Agent Skills — clickhouse-best-practices deployment skill
     },
     "context_reviewer": {

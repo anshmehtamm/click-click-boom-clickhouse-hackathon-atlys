@@ -182,6 +182,18 @@ function agentBadge(step) {
   return ["Pipeline", "agent-pipeline"];
 }
 
+// LibreChat's function_call.arguments is always empty (confirmed via direct API
+// testing), so a "skill" tool call never tells us WHICH skill loaded from its own
+// payload. But this deployment only has one real skill (LibreChat/skill/
+// clickhouse-best-practices/SKILL.md), statically attached per agents/prompts.py's
+// AGENTS dict to exactly these two agents (skills_enabled: True) -- so a static
+// lookup by agent is accurate, not a guess. Update this map if a second skill or a
+// different attachment ever gets added.
+const SKILL_BY_AGENT = {
+  "Instrumentation Proposer": "clickhouse-best-practices",
+  "Context Reviewer": "clickhouse-best-practices",
+};
+
 // Real tool families in this pipeline (see agents/prompts.py TOOLS_NOTE /
 // mcp_servers/*.py) -- names come straight from LibreChat's function_call.name,
 // which IS real (unlike arguments/output, confirmed absent from the API). Ordered
@@ -254,7 +266,12 @@ function renderTraceList() {
 function toolCallInfo(ev) {
   const m = (ev.step || "").match(/_tool\[(\d+)\]_(.+)$/);
   if (!m) return null;
-  return { index: m[1], ...classifyTool(m[2]) };
+  const info = { index: m[1], ...classifyTool(m[2]) };
+  if (info.name === "skill") {
+    const [agentLabel] = agentBadge(ev.step || "");
+    info.skillName = SKILL_BY_AGENT[agentLabel] || "unknown skill";
+  }
+  return info;
 }
 
 function eventLabel(ev) {
@@ -263,7 +280,10 @@ function eventLabel(ev) {
   if (ev.event === "span_start") return `▶ ${ev.step}`;
   if (ev.event === "span_end") return `◀ ${ev.step}`;
   const tool = toolCallInfo(ev);
-  if (tool) return `<span class="tool-badge ${tool.cls}">${tool.icon} ${tool.label}</span>${tool.name}`;
+  if (tool) {
+    const displayName = tool.skillName ? `${tool.name}: ${tool.skillName}` : tool.name;
+    return `<span class="tool-badge ${tool.cls}">${tool.icon} ${tool.label}</span>${displayName}`;
+  }
   return ev.step;
 }
 
@@ -295,8 +315,13 @@ function renderRow(ev, idx) {
   const parts = [];
   const tool = toolCallInfo(ev);
   if (tool) {
+    const skillLine = tool.skillName
+      ? `\n\n<span class="k">skill loaded</span>\n${tool.skillName}  (static lookup by agent — this deployment has ` +
+        `exactly one skill, LibreChat/skill/clickhouse-best-practices, attached only to Instrumentation Proposer + ` +
+        `Context Reviewer; the tool call itself carries no name since arguments are empty)`
+      : "";
     parts.push(
-      `<span class="k">tool</span>\n${tool.name}  (type: ${tool.label}, call #${tool.index} in this agent turn)\n\n` +
+      `<span class="k">tool</span>\n${tool.name}  (type: ${tool.label}, call #${tool.index} in this agent turn)${skillLine}\n\n` +
       `<span class="no-output">Arguments and output are not shown — LibreChat's Agents API (beta) never returns ` +
       `function_call arguments or a function_call_output item for any tool call (confirmed empirically across ` +
       `non-streaming, streaming, and streaming-with-reasoning-param requests). The tool name and call order above ` +

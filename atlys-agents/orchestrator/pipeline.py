@@ -27,13 +27,47 @@ from tracing import traced_run
 MAX_REVISIONS = 4
 
 
+class AgentOutputError(Exception):
+    """Raised when an agent's final message isn't valid JSON. Carries the raw text
+    so a caller can decide whether to retry-once (cheap, malformed JSON usually
+    isn't a design problem worth burning a full rework revision on) or feed it into
+    a proper rework round."""
+
+    def __init__(self, raw_text: str, parse_error: Exception):
+        self.raw_text = raw_text
+        self.parse_error = parse_error
+        super().__init__(f"Agent output was not valid JSON: {parse_error}")
+
+
 def _extract_json(text: str) -> dict:
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.split("```")[1]
-        if text.startswith("json"):
-            text = text[4:]
-    return json.loads(text.strip())
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("```")[1]
+        if cleaned.startswith("json"):
+            cleaned = cleaned[4:]
+    try:
+        return json.loads(cleaned.strip())
+    except json.JSONDecodeError as e:
+        raise AgentOutputError(text, e) from e
+
+
+def _call_json_agent(agent_id: str, payload: dict) -> dict:
+    """Calls an agent expecting JSON back; if the output doesn't parse, retries
+    ONCE with the parse error appended so the model can just fix its formatting —
+    cheap, and avoids burning a full rework revision on something that usually
+    isn't a design problem. Raises AgentOutputError if it still fails."""
+    r = call_agent(agent_id, json.dumps(payload))
+    try:
+        return _extract_json(r.output_text), r
+    except AgentOutputError as e:
+        retry_payload = dict(payload)
+        retry_payload["_previous_output_was_invalid_json"] = {
+            "your_previous_output": e.raw_text[:2000],
+            "parse_error": str(e.parse_error),
+            "instruction": "Output ONLY the JSON object this time — no markdown fences, no prose before or after it.",
+        }
+        r2 = call_agent(agent_id, json.dumps(retry_payload))
+        return _extract_json(r2.output_text), r2
 
 
 def _get_nested(d: dict, dotted_key: str):
@@ -170,23 +204,23 @@ def _propose(run, spec_name: str, spec_markdown: str, sample_events: list[dict],
         # thing that was wrong, which risks introducing a NEW issue elsewhere.
         payload["revise_to_address"] = prior_findings
         payload["previous_attempt"] = previous_draft
-    r = call_agent(os.environ["LIBRECHAT_AGENT_INSTRUMENTATION_PROPOSER"], json.dumps(payload))
+    result, r = _call_json_agent(os.environ["LIBRECHAT_AGENT_INSTRUMENTATION_PROPOSER"], payload)
     _log_agent_call(run, "propose", {"spec_name": spec_name, "n_sample_events": len(sample_events)}, r)
-    return _extract_json(r.output_text)
+    return result
 
 
 def _review(run, proposal: dict) -> dict:
     payload = {"proposal": proposal}
-    r = call_agent(os.environ["LIBRECHAT_AGENT_CONTEXT_REVIEWER"], json.dumps(payload))
+    result, r = _call_json_agent(os.environ["LIBRECHAT_AGENT_CONTEXT_REVIEWER"], payload)
     _log_agent_call(run, "review", {"table_name": proposal.get("table_name")}, r)
-    return _extract_json(r.output_text)
+    return result
 
 
 def _chronicle(run, executed_proposal: dict, spec_name: str) -> dict:
     payload = {"executed_proposal": executed_proposal, "spec_name": spec_name}
-    r = call_agent(os.environ["LIBRECHAT_AGENT_CONTEXT_CHRONICLER"], json.dumps(payload))
+    result, r = _call_json_agent(os.environ["LIBRECHAT_AGENT_CONTEXT_CHRONICLER"], payload)
     _log_agent_call(run, "chronicle", {"table_name": executed_proposal.get("table_name")}, r)
-    return _extract_json(r.output_text)
+    return result
 
 
 def ingest_spec(spec_name: str, spec_markdown: str, sample_events: list[dict], pm_question_queries: list[tuple[str, str]] | None = None) -> dict:
@@ -204,7 +238,22 @@ def ingest_spec(spec_name: str, spec_markdown: str, sample_events: list[dict], p
         final_review = None
 
         while True:
-            draft = _propose(run, spec_name, spec_markdown, sample_events, prior_findings, previous_draft)
+            try:
+                draft = _propose(run, spec_name, spec_markdown, sample_events, prior_findings, previous_draft)
+            except AgentOutputError as e:
+                # _call_json_agent already retried once internally; this means
+                # it failed twice in a row. Treat like any other failure mode —
+                # bounded feedback into the same loop, not a crash.
+                run.log(step="propose_json_error", input=e.raw_text[:1000], output=str(e.parse_error))
+                if revision >= MAX_REVISIONS:
+                    raise
+                revision += 1
+                prior_findings = [{
+                    "severity": "block", "category": "invalid_json",
+                    "description": f"Your last two attempts didn't produce valid JSON: {e.parse_error}",
+                    "suggested_fix": "Output ONLY a single JSON object matching the schema — no markdown fences, no prose, no truncation.",
+                }]
+                continue
             previous_draft = draft
             flattened_events = _flatten_events(sample_events, draft.get("column_mapping", {}))
 
@@ -270,7 +319,18 @@ def ingest_spec(spec_name: str, spec_markdown: str, sample_events: list[dict], p
                     confidence=proposal["confidence"], rationale=proposal["rationale"],
                 )
 
-            review = _review(run, proposal)
+            try:
+                review = _review(run, proposal)
+            except AgentOutputError as e:
+                # Reviewer failed to produce valid JSON twice in a row — treat as
+                # a request_changes with no specific findings (we don't know what
+                # it would have flagged) rather than crashing the whole pipeline.
+                run.log(step="review_json_error", input=e.raw_text[:1000], output=str(e.parse_error))
+                review = {"verdict": "request_changes", "findings": [{
+                    "severity": "block", "category": "reviewer_output_error",
+                    "description": f"Reviewer failed to produce valid JSON: {e.parse_error}",
+                    "suggested_fix": "Re-propose; the reviewer couldn't be evaluated this round.",
+                }], "context_sections_used": [], "reviewer_confidence": 0.0}
             _write_review(meta_client, proposal_id, revision, review, review.get("context_sections_used", []), run.url)
 
             final_proposal, final_review, final_flattened_events = proposal, review, flattened_events
@@ -376,12 +436,20 @@ def ingest_spec(spec_name: str, spec_markdown: str, sample_events: list[dict], p
             regression = run_regression_suite(proposal_id, run.url)
             run.log(step="regression_result", input=None, output={"passed": regression.passed, "n_tests": len(regression.results)})
 
+        chronicle_ok = True
         with run.span("chronicle"):
-            chronicle = _chronicle(run, final_proposal, spec_name)
-            _write_context_sections(meta_client, chronicle["sections"], run.url)
+            try:
+                chronicle = _chronicle(run, final_proposal, spec_name)
+                _write_context_sections(meta_client, chronicle["sections"], run.url)
+            except AgentOutputError as e:
+                # The schema itself is already executed and real — don't discard a
+                # successful run because the context-layer writeup failed. Surface
+                # it clearly instead of silently losing the context update.
+                run.log(step="chronicle_json_error", input=e.raw_text[:1000], output=str(e.parse_error))
+                chronicle_ok = False
 
         return {
             "status": "executed", "proposal_id": proposal_id, "table_name": final_proposal["table_name"],
             "ddl": final_proposal["ddl"], "revisions": revision, "regression_passed": regression.passed,
-            "trace_url": run.url,
+            "chronicle_ok": chronicle_ok, "trace_url": run.url,
         }

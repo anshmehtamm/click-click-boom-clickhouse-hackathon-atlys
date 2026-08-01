@@ -13,13 +13,13 @@ export async function getInsights(limit = 50): Promise<Insight[]> {
     query: `
       SELECT
         insight_id,
-        spec_name as spec_id,
-        '' as agent_run_id,
-        title as question,
-        summary as answer_text,
-        confidence as confidence_score,
-        evidence as supporting_evidence,
-        '[]' as contradicting_signals,
+        spec_name,
+        title,
+        summary,
+        confidence,
+        evidence,
+        related_known_issues,
+        segment_cuts,
         formatDateTime(ts, '%Y-%m-%d %H:%i:%s') as created_at,
         trace_url
       FROM agent_meta.insights

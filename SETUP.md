@@ -116,10 +116,19 @@ Admin panel on `:3000` needs `ADMIN_PANEL_SESSION_SECRET` set or it crash-loops.
 
 ---
 
-## 3. Register an account, create an agent, get an Agents API key
+## 3. Register an account, create the 4 agents, get an Agents API key
 
-All scripted — no browser needed. **Always send a real `User-Agent` header** (gotcha
-#4) or you'll get auto-banned.
+**Fast path**: register manually (one curl call below), put the admin email/password
+into `atlys-agents/.env` (`LIBRECHAT_ADMIN_EMAIL`/`LIBRECHAT_ADMIN_PASSWORD`), then run
+`atlys-agents/.venv/bin/python agents/create_agents.py` — it logs in, creates all 4
+agents from `agents/prompts.py`, generates an Agents API key if you don't have one
+yet, and writes every ID back into `.env` automatically. Re-run it any time you edit a
+prompt in `agents/prompts.py` — it creates fresh agents (LibreChat doesn't have an
+upsert-by-name; old ones are left in place, harmless, or delete via `DELETE /api/agents/:id`).
+
+The manual steps below are what `create_agents.py` does under the hood — useful if
+you need to debug it or create a one-off agent by hand. **Always send a real
+`User-Agent` header** (gotcha #4) or you'll get auto-banned.
 
 ```bash
 UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"

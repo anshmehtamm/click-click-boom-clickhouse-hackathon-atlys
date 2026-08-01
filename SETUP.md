@@ -1,0 +1,204 @@
+# Setup — Atlys agentic analytics pipeline
+
+Two pieces: `atlys-agents/` (our code — committed to this repo) and a local `LibreChat/`
+instance (a clone of the upstream project, **not committed** — too large, third-party,
+and config-only for us). This doc gets a fresh machine to the same state we're at.
+
+No secrets are committed anywhere. Every `.env` file below is gitignored; use the
+`.env.example` templates and fill in real values locally.
+
+---
+
+## 0. Prerequisites
+
+- **Python 3.11+** — `clickhouse-connect` needs 3.9+; if your default `python3` is
+  older (check with `python3 --version`), install 3.11 via `pyenv install 3.11.0`.
+  `atlys-agents/.python-version` pins this automatically once you're inside the dir.
+- **Docker Desktop**, running.
+- A **ClickHouse Cloud** service with the `atlys` database already loaded (see
+  `click-a-thon-2026-main/Atlys/data/load.sh` in the hackathon package — clone that
+  repo with `git clone` if the parquet files are Git LFS pointers, not zip-download).
+- A **Langfuse Cloud** project (cloud.langfuse.com or a regional host like
+  us.cloud.langfuse.com) — get public/secret keys from project settings.
+- An LLM provider API key with actual credit/quota (OpenAI or Anthropic). Verify it
+  works with a bare `curl` against the provider's API directly before assuming
+  LibreChat config is broken — see gotcha #3 below, this exact failure mode bit us.
+
+---
+
+## 1. `atlys-agents/` — the agent/orchestrator codebase
+
+```bash
+cd atlys-agents
+python3 -m venv .venv        # use pyenv's 3.11.0 python3 if your system default is older
+.venv/bin/pip install -r requirements.txt
+
+cp .env.example .env
+# fill in .env:
+#   CLICKHOUSE_HOST / CLICKHOUSE_PASSWORD  — your ClickHouse Cloud service
+#   LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_HOST
+#   LIBRECHAT_URL / LIBRECHAT_API_KEY / LIBRECHAT_AGENT_*  — filled in during step 2
+```
+
+Bootstrap the agent metadata layer and verify each piece independently:
+
+```bash
+.venv/bin/python scripts/init_db.py             # creates agent_meta DB + 6 tables
+.venv/bin/python scripts/seed_context.py        # seeds the 31-section context layer
+.venv/bin/python scripts/smoke_test_tracing.py  # proves Langfuse wiring works
+.venv/bin/python scripts/smoke_test_perf_tool.py  # proves perf_tool against real atlys data
+```
+
+`smoke_test_tracing.py` prints a trace URL — open it and confirm you see a root span
+with a nested child span. `smoke_test_perf_tool.py` prints a full perf comparison
+JSON — confirm it completes without error and reports a `winner`.
+
+---
+
+## 2. LibreChat — local instance, Agents API enabled
+
+```bash
+cd ..
+git clone https://github.com/danny-avila/LibreChat.git
+cd LibreChat
+cp .env.example .env
+cp librechat.example.yaml librechat.yaml
+```
+
+### 2a. Enable remote agents in `librechat.yaml`
+
+Find the commented `remoteAgents:` block under `interface:` and uncomment/set:
+
+```yaml
+interface:
+  agents:
+    use: true
+    create: true
+  remoteAgents:
+    use: true
+    create: true
+    share: false
+    public: false
+```
+
+### 2b. Mount the config file into the container (gotcha #1 below)
+
+`docker-compose.yml` only bind-mounts `.env` by default — `librechat.yaml` is silently
+ignored unless you add an override. Create `docker-compose.override.yml`:
+
+```yaml
+services:
+  api:
+    volumes:
+      - type: bind
+        source: ./librechat.yaml
+        target: /app/librechat.yaml
+```
+
+### 2c. Fill in `.env`
+
+```
+UID=<your `id -u`>
+GID=<your `id -g`>
+ADMIN_PANEL_SESSION_SECRET=<openssl rand -hex 32>
+ANTHROPIC_API_KEY=...   # and/or
+OPENAI_API_KEY=...
+```
+
+### 2d. Bring it up
+
+```bash
+docker compose up -d
+```
+
+Verify: `curl -s -o /dev/null -w "%{http_code}\n" http://localhost:3080/` → `200`.
+Admin panel on `:3000` needs `ADMIN_PANEL_SESSION_SECRET` set or it crash-loops.
+
+---
+
+## 3. Register an account, create an agent, get an Agents API key
+
+All scripted — no browser needed. **Always send a real `User-Agent` header** (gotcha
+#4) or you'll get auto-banned.
+
+```bash
+UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+
+# Register — first registered user becomes ADMIN automatically
+curl -s -A "$UA" -X POST http://localhost:3080/api/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"name":"...", "email":"...", "password":"...", "confirm_password":"..."}'
+
+# Log in — JWT expires in ~15 min, re-run this if calls start failing
+curl -s -A "$UA" -c /tmp/lc_cookies.txt -X POST http://localhost:3080/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"...", "password":"..."}' -o /tmp/lc_login.json
+JWT=$(python3 -c "import json; print(json.load(open('/tmp/lc_login.json'))['token'])")
+
+# Create an agent — note: /api/agents (NOT /api/agents/v1 — gotcha #2),
+# and provider is case-sensitive: "openAI" not "openai" (gotcha #5)
+curl -s -A "$UA" -X POST http://localhost:3080/api/agents \
+  -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -d '{"name":"...", "provider":"openAI", "model":"gpt-4o-mini",
+       "model_parameters":{"model":"gpt-4o-mini"}, "instructions":"..."}'
+# -> save the returned "id" (agent_xxx) into atlys-agents/.env as one of the
+#    LIBRECHAT_AGENT_* variables
+
+# Generate a remote-agents API key — note the hyphen: /api/api-keys
+curl -s -A "$UA" -X POST http://localhost:3080/api/api-keys \
+  -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -d '{"name": "orchestrator"}'
+# -> save the returned "key" into atlys-agents/.env as LIBRECHAT_API_KEY
+```
+
+Verify with the actual invocation path (`/v1/responses`, API-key auth, not JWT):
+
+```bash
+curl -s -X POST http://localhost:3080/api/agents/v1/responses \
+  -H "Authorization: Bearer <LIBRECHAT_API_KEY>" -H "Content-Type: application/json" \
+  -d '{"model": "<agent_id>", "input": "Reply with exactly the word: pong"}'
+```
+
+Or from Python: `atlys-agents/.venv/bin/python -c "from librechat_client import call_agent; print(call_agent('<agent_id>', 'ping').output_text)"`
+
+---
+
+## Gotchas hit while setting this up (save yourself the debugging time)
+
+1. **`librechat.yaml` not mounted by default.** Silent — server logs
+   `ENOENT: no such file or directory, open '/app/librechat.yaml'` and just runs with
+   defaults (remoteAgents stays off). Fix: step 2b above.
+2. **Agent creation is `POST /api/agents`, not `/api/agents/v1`.** The `/v1` prefix is
+   reserved for the remote-invocation endpoints (`/v1/responses`, `/v1/chat/completions`),
+   which use API-key auth, not your JWT session. Hitting `/api/agents/v1` with a JWT
+   routes into the wrong handler and returns a misleading `"Invalid API key"` error.
+3. **A "provider key invalid" error from LibreChat isn't proof the key is bad.**
+   Test the raw key directly against the provider's API first
+   (`curl https://api.anthropic.com/v1/messages ...` / `api.openai.com/v1/chat/completions`).
+   We hit this exact case: an Anthropic key that authenticated fine but had zero
+   credit balance — the error only showed up as an opaque failure inside LibreChat.
+4. **`curl` requests get auto-banned as `non_browser` violations.** LibreChat's
+   anti-abuse middleware penalizes requests lacking browser-like headers; 20
+   violations triggers a 2-hour ban. Always send a `User-Agent` header on scripted
+   calls. If you do get banned (self-hosted local instance, so this is safe):
+   ```bash
+   docker exec chat-mongodb mongosh LibreChat --quiet --eval \
+     "db.logs.deleteMany({key: {\$regex: '^(BANS|ban):'}})"
+   ```
+5. **Provider names are case-sensitive and not what you'd guess.** It's `openAI`
+   (capital AI), not `openai`. Source of truth:
+   `packages/data-provider/src/schemas.ts` → `EModelEndpoint.openAI = 'openAI'`.
+6. **JWTs expire in ~15 minutes.** If a previously-working curl script starts failing
+   with auth errors, re-login before debugging anything else.
+7. **The Agents API key uses the endpoint `/api/api-keys`** (hyphenated) — `/api/apiKeys`
+   404s.
+
+---
+
+## What's committed vs. not
+
+- **Committed:** `atlys-agents/` (all code, SQL, scripts), this file, `team_plan/PLAN.md`,
+  `table-analysis/`.
+- **Not committed** (gitignored): `atlys-agents/.env`, `atlys-agents/.venv/`,
+  `LibreChat/` in its entirety (clone fresh per step 2 — it's a large third-party repo
+  and all our changes to it are config-only, fully reproducible from this doc).

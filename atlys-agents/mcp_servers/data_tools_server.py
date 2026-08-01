@@ -214,20 +214,27 @@ def _check_imports_allowed(code: str) -> str | None:
 @server.tool()
 def execute_python(code: str) -> dict:
     """Runs Python for dataframe analysis SQL can't express cleanly (correlation,
-    pivoting, custom stats over a scratch file from run_query) — pandas ONLY, no
-    other imports permitted (checked before execution; you'll get an error, not a
-    silent failure, if you try). NOT strongly sandboxed — plain subprocess, same OS
-    privileges as this tool server, no container isolation, no network,
-    15s timeout. Working directory is the scratch dir, so
-    `pd.read_json("some_query_file.ndjson", lines=True)` works with just the
-    filename. Print everything you want to see; only stdout/stderr are returned
-    (truncated if long)."""
+    pivoting, custom stats over a scratch file from run_query) — pandas is ALREADY
+    imported as `pd`, don't import it yourself; no other imports permitted (checked
+    before execution; you'll get an error, not a silent failure, if you try). NOT
+    strongly sandboxed — plain subprocess, same OS privileges as this tool server,
+    no container isolation, no network, 15s timeout. Working directory is the
+    scratch dir, so `pd.read_json("some_query_file.ndjson", lines=True)` works with
+    just the filename. Print everything you want to see; only stdout/stderr are
+    returned (truncated if long)."""
     import_error = _check_imports_allowed(code)
     if import_error:
         return {"stdout": "", "stderr": import_error, "exit_code": -1, "truncated": False}
     try:
+        # pd pre-imported here rather than relying on the model to remember its
+        # own `import pandas as pd` -- a real run hit the identical NameError
+        # ("pd is not defined") repeatedly across several tool calls because it
+        # kept forgetting. Safe to prepend unconditionally: pandas is the only
+        # allowed import, and Python re-importing an already-imported module is
+        # a no-op if the model's own code also imports it.
+        full_code = "import pandas as pd\n" + code
         result = subprocess.run(
-            [sys.executable, "-c", code],
+            [sys.executable, "-c", full_code],
             cwd=SCRATCH_DIR, capture_output=True, text=True, timeout=EXEC_TIMEOUT_S,
         )
         return {

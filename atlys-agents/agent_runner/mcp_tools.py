@@ -54,11 +54,27 @@ async def _call_tool(server: str, tool_name: str, arguments: dict) -> str:
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool(tool_name, arguments)
-            # MCP tool results are a list of content blocks; ours are always a
-            # single text block (see mcp_servers/*.py -- every tool returns a
-            # dict/list, FastMCP serializes it to one text block).
+            # MCP tool results are a list of content blocks. That assumption
+            # of "always a single text block" was wrong for any tool whose
+            # Python return type is a top-level list (list_context_sections,
+            # lookup_context, grep_scratch, read_scratch): FastMCP emits ONE
+            # content block PER LIST ITEM, not one block containing the whole
+            # array -- confirmed directly (list_context_sections's 30 real
+            # sections came back as 30 separate blocks). Naively
+            # newline-joining those isn't valid JSON at all (no brackets, no
+            # commas), which broke every frontend widget expecting
+            # Array.isArray(output) on tools that return a list (e.g.
+            # ContextIndexWidget/ContextLookupWidget silently rendered as
+            # empty). Reassemble multi-block results into a real JSON array
+            # when each block parses as JSON; a single block (the common
+            # case -- every dict-returning tool) is returned as-is unchanged.
             parts = [getattr(c, "text", str(c)) for c in result.content]
-            return "\n".join(parts)
+            if len(parts) <= 1:
+                return parts[0] if parts else ""
+            try:
+                return json.dumps([json.loads(p) for p in parts])
+            except json.JSONDecodeError:
+                return "\n".join(parts)
 
 
 def openai_tool_defs(tool_names: list[str]) -> list[dict]:

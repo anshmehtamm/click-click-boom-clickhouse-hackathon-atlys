@@ -23,7 +23,15 @@ function StatusDot({ status }: { status: string }) {
   );
 }
 
-function ConfidenceCell({ value }: { value: number }) {
+// A proposal's confidence is self-reported by the proposer on its very first
+// draft, before review/rework/execution ever happen -- schema_proposals is
+// append-only, so `latest_confidence` reflects whatever the MOST RECENT
+// revision wrote, which can be a mid-flight draft. Showing it like a final
+// score while the spec is still `pending_review`/`needs_rework` reads as
+// more settled than it is -- only surface it once the run has actually
+// reached `executed`.
+function ConfidenceCell({ status, value }: { status: string; value: number }) {
+  if (status !== 'executed') return <span className="text-[11px] italic" style={{ color: '#c0b8b0' }}>in progress</span>;
   if (!value) return <span style={{ color: '#c0b8b0' }}>—</span>;
   const pct = Math.round(value * 100);
   const color = pct >= 80 ? '#16a34a' : pct >= 60 ? '#d97706' : '#dc2626';
@@ -60,7 +68,7 @@ function SpecRow({ spec }: { spec: SpecSummary }) {
         {spec.table_name || '—'}
       </span>
 
-      <ConfidenceCell value={spec.latest_confidence} />
+      <ConfidenceCell status={spec.latest_status} value={spec.latest_confidence} />
 
       <span className="text-[11px] font-mono tabular-nums text-right" style={{ color: '#c0b8b0' }}>
         {spec.last_run.slice(5, 16).replace('T', ' ')}
@@ -86,6 +94,15 @@ export default function SpecsPage() {
     // agent-panel.tsx fires this after a successful new-spec run
     window.addEventListener('specs-updated', refetch);
     return () => window.removeEventListener('specs-updated', refetch);
+  }, []);
+
+  // If an ingestion is still running (e.g. this tab got reloaded mid-run),
+  // reopen the panel automatically -- it reattaches to the live trace itself
+  // via lib/live-run-store.ts on mount.
+  useEffect(() => {
+    fetch('/api/live-run').then(r => r.json()).then(d => {
+      if (d.active) openAgentPanel();
+    }).catch(() => {});
   }, []);
 
   return (

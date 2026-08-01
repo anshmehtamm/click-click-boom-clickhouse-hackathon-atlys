@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server';
 import { spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs';
+import { startRun, pushRawEvent, finishRun, getSnapshot } from '@/lib/live-run-store';
 
 export const maxDuration = 300; // 5 minutes for long-running ingestion
 
@@ -11,6 +12,21 @@ export async function POST(request: NextRequest) {
     const specName = formData.get('specName') as string;
     const specMarkdown = formData.get('specMarkdown') as string;
     const eventsFile = formData.get('eventsFile') as File;
+
+    // live-run-store is a single global slot (this pipeline runs one
+    // ingestion at a time by design) -- starting a second one while the
+    // first is still active would silently clobber it, corrupting whatever
+    // is currently reconnected/polling. Reject instead of racing.
+    const inFlight = getSnapshot();
+    if (inFlight.active) {
+      const encoder = new TextEncoder();
+      return new Response(encoder.encode(JSON.stringify({
+        type: 'error',
+        message: `An ingestion for "${inFlight.specName}" is already running — wait for it to finish before starting another.`,
+      })), {
+        headers: { 'Content-Type': 'text/event-stream' },
+      });
+    }
 
     if (!specName || !specMarkdown || !eventsFile) {
       const encoder = new TextEncoder();
@@ -120,6 +136,7 @@ except Exception as e:
         fs.writeFileSync(tmpScriptPath, pythonScript);
 
         sendEvent({ type: 'log', stage: 'init', message: '🚀 Initializing pipeline...' });
+        startRun(specName);
 
         const agentsDir = path.join(process.cwd(), '../atlys-agents');
         const venvPython = path.join(agentsDir, '.venv/bin/python');
@@ -160,6 +177,7 @@ except Exception as e:
                 finalResult = parsed.data;
               } else {
                 sendEvent(parsed);
+                if (parsed.type === 'trace_event') pushRawEvent(parsed);
               }
             } catch (e) {
               // If not JSON, send as raw log
@@ -192,21 +210,18 @@ except Exception as e:
             try { fs.unlinkSync(f); } catch { /* ignore */ }
           }
 
-          if (finalResult) {
-            sendEvent({ type: 'complete', result: finalResult });
-          } else {
-            sendEvent({
-              type: 'complete',
-              result: { status: 'failed', error: `Process exited with code ${code} — check run log above` }
-            });
-          }
+          const result = finalResult ?? { status: 'failed', error: `Process exited with code ${code} — check run log above` };
+          sendEvent({ type: 'complete', result });
+          finishRun(result);
           controller.close();
         });
 
         // Timeout after 4 minutes
         setTimeout(() => {
           python.kill();
-          sendEvent({ type: 'error', message: 'Pipeline timeout after 4 minutes' });
+          const result = { status: 'failed', error: 'Pipeline timeout after 4 minutes' };
+          sendEvent({ type: 'error', message: result.error });
+          finishRun(result);
           controller.close();
         }, 240000);
       }

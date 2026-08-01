@@ -1,5 +1,6 @@
 'use client';
-import { Brain } from 'lucide-react';
+import { useState } from 'react';
+import { Brain, Wrench, ShieldCheck, BookMarked, LineChart, Loader2, ChevronRight, ChevronDown } from 'lucide-react';
 import type { AgentEvent } from './types';
 import { getEventFamily, cleanToolName, elapsed } from './utils';
 import { SqlWidget } from './widgets/SqlWidget';
@@ -77,16 +78,105 @@ function EventWidget({ event }: { event: AgentEvent }) {
   }
 }
 
+// ── Phase grouping ───────────────────────────────────────────────────────────
+// Every step name is prefixed with which agent call produced it -- pipeline.py
+// calls _call_json_agent(..., "propose"/"review"/"chronicle", ...) and
+// analytics_agent.py calls it with "analytics"; sub-steps are
+// "{step}_reasoning[turnN]"/"{step}_tool[i]_{name}"/"{step}_generation". That
+// prefix is the real phase boundary — surfacing it (with which revision
+// attempt, since propose/review repeat on rework) is what actually answers
+// "which agent is doing this right now."
+type PhaseIcon = React.ComponentType<{ className?: string; style?: React.CSSProperties }>;
+
+const PHASE_META: Record<string, { label: string; icon: PhaseIcon; accent: string }> = {
+  propose:    { label: 'Instrumentation Proposer', icon: Wrench,      accent: '#d97706' },
+  review:     { label: 'Context Reviewer',         icon: ShieldCheck, accent: '#2563eb' },
+  chronicle:  { label: 'Context Chronicler',       icon: BookMarked,  accent: '#7c3aed' },
+  analytics:  { label: 'Analytics Agent',          icon: LineChart,   accent: '#16a34a' },
+};
+
+function derivePhaseKey(step: string): string {
+  return step.match(/^[a-zA-Z]+/)?.[0] ?? 'pipeline';
+}
+
+interface PhaseGroup { key: string; occurrence: number; events: AgentEvent[] }
+
+// Groups by CONSECUTIVE runs of the same phase, not by phase identity alone —
+// a rework loop revisits "propose" and "review" multiple times, and each
+// pass should read as its own section in execution order, not get merged
+// with an earlier attempt.
+function groupByPhase(events: AgentEvent[]): PhaseGroup[] {
+  const groups: PhaseGroup[] = [];
+  const occurrenceCounts: Record<string, number> = {};
+  let current: PhaseGroup | null = null;
+  for (const ev of events) {
+    const key = derivePhaseKey(ev.step);
+    if (!current || current.key !== key) {
+      occurrenceCounts[key] = (occurrenceCounts[key] ?? 0) + 1;
+      current = { key, occurrence: occurrenceCounts[key], events: [] };
+      groups.push(current);
+    }
+    current.events.push(ev);
+  }
+  return groups;
+}
+
+// Tool-call/generation/reasoning count -- what "expand to see N things" means
+// for this group, since a thinking event isn't a tool call but still counts
+// as something the reader would want a heads-up about.
+function phaseCounts(group: PhaseGroup): { tools: number; total: number } {
+  return {
+    tools: group.events.filter(e => e.kind === 'tool_call').length,
+    total: group.events.length,
+  };
+}
+
+function PhaseSection({ group, isLive, defaultOpen }: { group: PhaseGroup; isLive: boolean; defaultOpen: boolean }) {
+  const [open, setOpen] = useState(defaultOpen);
+  const meta = PHASE_META[group.key] ?? { label: group.key, icon: Wrench, accent: '#6b7280' };
+  const Icon = meta.icon;
+  const { tools, total } = phaseCounts(group);
+
+  return (
+    <div className="rounded-xl border overflow-hidden mt-3 first:mt-0"
+      style={{ borderColor: meta.accent + '35', backgroundColor: meta.accent + '08' }}>
+      <button
+        onClick={() => setOpen(v => !v)}
+        className="w-full flex items-center gap-2 px-3 py-2.5 text-left hover:opacity-85 transition-opacity"
+      >
+        {isLive ? <Loader2 className="h-4 w-4 flex-shrink-0 animate-spin" style={{ color: meta.accent }} />
+                : <Icon className="h-4 w-4 flex-shrink-0" style={{ color: meta.accent }} />}
+        <span className="text-[12.5px] font-bold" style={{ color: meta.accent }}>
+          {meta.label}
+        </span>
+        <span className="text-[10.5px] font-mono tabular-nums" style={{ color: meta.accent, opacity: 0.7 }}>
+          {tools > 0 ? `${tools} tool call${tools !== 1 ? 's' : ''}` : `${total} step${total !== 1 ? 's' : ''}`}
+        </span>
+        <div className="flex-1" />
+        {open ? <ChevronDown className="h-3.5 w-3.5 flex-shrink-0" style={{ color: meta.accent }} />
+              : <ChevronRight className="h-3.5 w-3.5 flex-shrink-0" style={{ color: meta.accent }} />}
+      </button>
+      {open && (
+        <div className="px-2 pb-2 space-y-0.5">
+          {group.events.map(ev => <EventWidget key={ev.id} event={ev} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Main component ─────────────────────────────────────────────────────────────
-// No header, no filter bar, no external trace link — just the live thinking
-// + tool-call feed, in order, using each event's own widget.
+// No filter bar, no external trace link — grouped into a clearly separate,
+// collapsible card per agent phase, with only the thinking + tool-call feed
+// inside each.
 
 interface TraceViewerProps {
   events: AgentEvent[];
   className?: string;
+  active?: boolean; // run still in progress -- the LAST phase group gets a spinner
 }
 
-export function TraceViewer({ events, className }: TraceViewerProps) {
+export function TraceViewer({ events, className, active }: TraceViewerProps) {
   const visible = events.filter(ev => VISIBLE_KINDS.has(ev.kind));
 
   if (visible.length === 0) {
@@ -97,11 +187,18 @@ export function TraceViewer({ events, className }: TraceViewerProps) {
     );
   }
 
+  const groups = groupByPhase(visible);
+
   return (
     <div className={className}>
-      <div className="space-y-0.5">
-        {visible.map(ev => <EventWidget key={ev.id} event={ev} />)}
-      </div>
+      {groups.map((group, i) => (
+        <PhaseSection
+          key={`${group.key}-${group.occurrence}`}
+          group={group}
+          isLive={!!active && i === groups.length - 1}
+          defaultOpen={i === groups.length - 1}
+        />
+      ))}
     </div>
   );
 }

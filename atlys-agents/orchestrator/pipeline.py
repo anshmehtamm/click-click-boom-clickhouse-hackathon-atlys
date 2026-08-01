@@ -40,7 +40,7 @@ SCRATCH_DIR.mkdir(exist_ok=True)
 # (all three now feed back into the same propose->review->test->execute loop) —
 # higher than a review-only cap would need, since it now has to cover more failure
 # modes with the same total attempts.
-MAX_REVISIONS = 4
+MAX_REVISIONS = 6
 
 
 # AgentOutputError, _extract_json, _call_json_agent now live in

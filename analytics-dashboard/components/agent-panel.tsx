@@ -147,25 +147,66 @@ export function AgentPanel() {
   // how this spec was most recently ingested, same events/widgets as a live
   // run — plus /runs just for the small status badge in the header (not the
   // trace content itself, which now comes from real events).
+  //
+  // Gap this closes: clicking a spec row always opened history mode, which
+  // only ever looked at trace_events -- but that table is only populated by
+  // ONE bulk insert at traced_run()'s END (see lib/live-run-store.ts's
+  // docstring for why). If you reload and click the spec that's STILL
+  // running, history mode found nothing there yet and showed "no persisted
+  // trace", even though the run was actively producing a real trace this
+  // whole time. Check live-run-store FIRST for this exact spec; only fall
+  // back to the persisted fetch if it isn't the one currently in flight.
   const [historyEvents, setHistoryEvents]   = useState<AgentEvent[]>([]);
   const [historyMeta,   setHistoryMeta]     = useState<{ status?: string } | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError,   setHistoryError]   = useState<string | null>(null);
+  const [historyIsLive,  setHistoryIsLive]  = useState(false);
 
   useEffect(() => {
     if (panelMode !== 'history' || !historySpec) return;
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
     setHistoryLoading(true);
     setHistoryError(null);
-    Promise.all([
-      fetch(`/api/specs/${historySpec}/events`).then(r => r.json()),
-      fetch(`/api/specs/${historySpec}/runs`).then(r => r.json()),
-    ])
-      .then(([eventsRes, runsRes]) => {
-        setHistoryEvents((eventsRes.events ?? []).map(normalizeTraceEvent));
-        setHistoryMeta({ status: runsRes.proposals?.[0]?.status });
-      })
-      .catch(e => setHistoryError(String(e)))
-      .finally(() => setHistoryLoading(false));
+    setHistoryIsLive(false);
+
+    const loadPersisted = () => {
+      Promise.all([
+        fetch(`/api/specs/${historySpec}/events`).then(r => r.json()),
+        fetch(`/api/specs/${historySpec}/runs`).then(r => r.json()),
+      ])
+        .then(([eventsRes, runsRes]) => {
+          setHistoryEvents((eventsRes.events ?? []).map(normalizeTraceEvent));
+          setHistoryMeta({ status: runsRes.proposals?.[0]?.status });
+        })
+        .catch(e => setHistoryError(String(e)))
+        .finally(() => setHistoryLoading(false));
+    };
+
+    const pollLive = () => {
+      fetch('/api/live-run').then(r => r.json()).then(d => {
+        if (d.specName !== historySpec) return; // a different spec started while we were watching
+        setHistoryEvents(d.events.map(normalizeTraceEvent));
+        if (!d.active) {
+          if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+          setHistoryIsLive(false);
+          loadPersisted(); // the run just finished -- switch to the durable record
+        }
+      }).catch(() => {});
+    };
+
+    fetch('/api/live-run').then(r => r.json()).then(d => {
+      if (d.active && d.specName === historySpec) {
+        setHistoryIsLive(true);
+        setHistoryLoading(false);
+        setHistoryEvents(d.events.map(normalizeTraceEvent));
+        setHistoryMeta({ status: 'running' });
+        pollTimer = setInterval(pollLive, 1500);
+      } else {
+        loadPersisted();
+      }
+    }).catch(loadPersisted);
+
+    return () => { if (pollTimer) clearInterval(pollTimer); };
   }, [panelMode, historySpec]);
 
   const [mode,     setMode]     = useState<Mode>('idle');
@@ -214,6 +255,46 @@ export function AgentPanel() {
 
   const addLog = (stage: string, message: string) =>
     setLogs(prev => [...prev, { id: crypto.randomUUID(), stage, message, ts: Date.now() }]);
+
+  // Reattach to an in-progress (or just-finished) ingestion on mount --
+  // /api/ingest's SSE stream is tied to the browser request that started it,
+  // so a page reload loses it entirely otherwise (see lib/live-run-store.ts).
+  // Only relevant in 'new' mode -- history mode already fetches its own data.
+  useEffect(() => {
+    if (panelMode !== 'new') return;
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+
+    // Only reconnect into 'running' -- a leftover FINISHED snapshot from
+    // whatever ran last must never hijack a fresh "New Spec" panel into
+    // showing a stale result (the store keeps the last result around only so
+    // a reload during the trailing "Done" screen doesn't lose it, not so the
+    // NEXT unrelated panel open inherits it).
+    const applySnapshot = (data: { specName: string | null; active: boolean; events: any[]; result: any }): boolean => {
+      if (!data.active || !data.specName) return false;
+      setSpecName(data.specName);
+      setTraceEvents(data.events.map(normalizeTraceEvent));
+      setMode('running');
+      return true;
+    };
+
+    fetch('/api/live-run').then(r => r.json()).then(data => {
+      const active = applySnapshot(data);
+      if (active) {
+        pollTimer = setInterval(() => {
+          fetch('/api/live-run').then(r => r.json()).then(d => {
+            const stillActive = applySnapshot(d);
+            if (!stillActive) {
+              if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+              if (d.result) { setResult(d.result); setMode('done'); }
+            }
+          }).catch(() => {});
+        }, 1500);
+      }
+    }).catch(() => {});
+
+    return () => { if (pollTimer) clearInterval(pollTimer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [panelMode]);
 
   // /api/ingest's stderr handler forwards EVERY line from the Python
   // subprocess as a log entry, most classified 'trace'/'tool'/'warning' --
@@ -352,8 +433,8 @@ export function AgentPanel() {
         <div className="flex items-center gap-2 min-w-0">
           {panelMode === 'history' ? (
             <>
-              {historyLoading && <Loader2 className="h-4 w-4 animate-spin text-blue-500 flex-shrink-0" />}
-              {!historyLoading && <FolderOpen className="h-4 w-4 flex-shrink-0" style={{ color: '#9c9088' }} />}
+              {(historyLoading || historyIsLive) && <Loader2 className="h-4 w-4 animate-spin text-blue-500 flex-shrink-0" />}
+              {!historyLoading && !historyIsLive && <FolderOpen className="h-4 w-4 flex-shrink-0" style={{ color: '#9c9088' }} />}
               <span className="text-sm font-semibold font-mono truncate" style={{ color: '#1c1814' }}>
                 {historySpec}
               </span>
@@ -423,7 +504,7 @@ export function AgentPanel() {
               </p>
             )}
             {!historyLoading && historyEvents.length > 0 && (
-              <TraceViewer events={historyEvents} />
+              <TraceViewer events={historyEvents} active={historyIsLive} />
             )}
           </div>
         )}
@@ -509,7 +590,7 @@ export function AgentPanel() {
               <p className="py-8 text-center text-xs" style={{ color: '#c0b8b0' }}>Initializing…</p>
             ) : (
               <>
-                {traceEvents.length > 0 && <TraceViewer events={traceEvents} />}
+                {traceEvents.length > 0 && <TraceViewer events={traceEvents} active />}
                 {/* init/complete/error only -- these come from the subprocess
                     wrapper itself, not run.log(), so they're not trace_events. */}
                 {visibleLogs.length > 0 && (

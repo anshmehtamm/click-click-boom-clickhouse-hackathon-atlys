@@ -53,6 +53,18 @@ def _extract_select(mv_ddl: str) -> str:
     return mv_ddl
 
 
+_CREATE_OBJECT_RE = re.compile(
+    r"\bCREATE\s+(?:TABLE|MATERIALIZED\s+VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z0-9_.]+)", re.IGNORECASE
+)
+
+
+def _created_object_name(stmt: str) -> str | None:
+    """Name of the table/view a CREATE statement declares (e.g. 'atlys.my_view' or
+    'my_view'), or None if this statement doesn't create one (rare — a plain query)."""
+    m = _CREATE_OBJECT_RE.search(stmt)
+    return m.group(1) if m else None
+
+
 def _substitute_names(sql: str, mapping: dict[str, str]) -> str:
     """Replaces real table/MV names with their scratch equivalents in ONE pass,
     longest-name-first, so a scratch name that happens to contain a shorter real
@@ -145,45 +157,104 @@ def run_new_table_tests(
                     passed=False, actual=f"ERROR: {e}", duration_ms=round(elapsed, 2),
                 ))
 
-        # --- mv_integrity: test each proposed MV's underlying query against the
-        # scratch table (which has real sample data), *before* it ever touches
-        # production. Substitution is name-mapping-based (not naive sequential
-        # .replace, which double-substitutes when the scratch name embeds the real
+        # --- mv_integrity: TWO checks per MV, both against scratch, before anything
+        # touches production.
+        #
+        # (1) DDL check — run the agent's ACTUAL CREATE TABLE/CREATE MATERIALIZED
+        #     VIEW statement(s) verbatim (name-substituted only), not a synthetic
+        #     stand-in. This matters: an earlier version of this function tested
+        #     the MV's query logic by re-wrapping it in our OWN `CREATE TABLE ...
+        #     ENGINE = MergeTree ORDER BY tuple() AS <select>` — which silently
+        #     discarded whatever ENGINE/ORDER BY the agent actually declared. That
+        #     let a Nullable-column-in-ORDER-BY bug slip through test_harness
+        #     completely and only surface at real execution, burning a full
+        #     rework round for something scratch testing should have caught in
+        #     round 1. Found by inspecting a real trace, not anticipated.
+        # (2) Query-logic check — the extracted SELECT, run standalone. Still
+        #     needed separately: ClickHouse materialized views only process NEW
+        #     inserts after creation (no POPULATE here), so querying a freshly
+        #     created MV's target table would show 0 rows regardless of whether
+        #     the query logic is actually correct — this checks the logic itself.
+        #
+        # MVs are processed in order; each one's real created object(s) are
+        # registered in name_map so a later MV that joins against an earlier one
+        # (a legitimate chained-views pattern) resolves for real, not "table not
+        # found". Substitution is name-mapping-based, not naive sequential
+        # .replace (which double-substitutes when a scratch name embeds a real
         # name as a substring — a real bug caught by inspecting a live failure).
-        # MVs are tested IN ORDER and each successfully-tested one is materialized
-        # into its own scratch table, so a later MV that JOINs against an earlier
-        # MV's output (a real, legitimate pattern — chained derived views) gets
-        # something real to join against instead of "table doesn't exist".
         mv_scratch_tables: list[str] = []
         name_map = {table_name: scratch_table}
         try:
             for mv in materialized_views or []:
                 mv_name = mv.get("name", f"mv_{uuid.uuid4().hex[:6]}")
+                local_map = dict(name_map)
+                ddl_ok = True
+
+                for raw_stmt in mv["ddl"].split(";"):
+                    stmt = raw_stmt.strip()
+                    if not stmt:
+                        continue
+                    created_name = _created_object_name(stmt)
+                    scratch_obj = None
+                    if created_name:
+                        bare = created_name.split(".")[-1]
+                        scratch_obj = f"{scratch_db}.{bare}__testharness__{uuid.uuid4().hex[:6]}"
+                        local_map[bare] = scratch_obj
+                    test_stmt = _substitute_names(stmt, local_map)
+                    t0 = time.perf_counter()
+                    try:
+                        client.command(test_stmt)
+                        elapsed = (time.perf_counter() - t0) * 1000
+                        results.append(TestResult(
+                            description=f"MV '{mv_name}' DDL: {created_name or 'statement'}",
+                            test_type="mv_integrity", query=test_stmt,
+                            passed=True, actual="created ok in scratch", duration_ms=round(elapsed, 2),
+                        ))
+                        if scratch_obj:
+                            mv_scratch_tables.append(scratch_obj)
+                    except Exception as e:
+                        elapsed = (time.perf_counter() - t0) * 1000
+                        results.append(TestResult(
+                            description=f"MV '{mv_name}' DDL: {created_name or 'statement'}",
+                            test_type="mv_integrity", query=test_stmt,
+                            passed=False, actual=f"ERROR: {e}", duration_ms=round(elapsed, 2),
+                        ))
+                        ddl_ok = False
+                        break  # later statements in this MV likely depend on this one
+
+                if not ddl_ok:
+                    continue  # don't bother query-testing a MV whose DDL doesn't even create
+
+                # First created object in this MV's own statements is its
+                # queryable data table in the common `CREATE TABLE target; CREATE
+                # MATERIALIZED VIEW ... TO target ...` pattern; for a single bare
+                # `CREATE MATERIALIZED VIEW ... AS SELECT` it's the only object.
+                mv_data_names = {k: v for k, v in local_map.items() if k not in name_map}
+                if mv_data_names:
+                    first_key = next(iter(mv_data_names))
+                    name_map[mv_name] = mv_data_names[first_key]
+
                 select_sql = _substitute_names(_extract_select(mv["ddl"]), name_map)
                 t0 = time.perf_counter()
                 try:
                     r = client.query(select_sql)
                     elapsed = (time.perf_counter() - t0) * 1000
                     results.append(TestResult(
-                        description=f"MV '{mv_name}' underlying query ({mv.get('answers_pm_question', '')})",
+                        description=f"MV '{mv_name}' query logic ({mv.get('answers_pm_question', '')})",
                         test_type="mv_integrity", query=select_sql,
                         passed=True, actual=f"ok, {r.row_count} rows returned", duration_ms=round(elapsed, 2),
                     ))
-                    # Materialize so subsequent MVs in this list can join against it.
-                    mv_scratch_table = f"{scratch_db}.{mv_name}__testharness__{uuid.uuid4().hex[:6]}"
-                    client.command(f"CREATE TABLE {mv_scratch_table} ENGINE = MergeTree ORDER BY tuple() AS {select_sql}")
-                    mv_scratch_tables.append(mv_scratch_table)
-                    name_map[mv_name] = mv_scratch_table
                 except Exception as e:
                     elapsed = (time.perf_counter() - t0) * 1000
                     results.append(TestResult(
-                        description=f"MV '{mv_name}' underlying query ({mv.get('answers_pm_question', '')})",
+                        description=f"MV '{mv_name}' query logic ({mv.get('answers_pm_question', '')})",
                         test_type="mv_integrity", query=select_sql,
                         passed=False, actual=f"ERROR: {e}", duration_ms=round(elapsed, 2),
                     ))
         finally:
             for t in mv_scratch_tables:
                 client.command(f"DROP TABLE IF EXISTS {t}")
+                client.command(f"DROP VIEW IF EXISTS {t}")
     finally:
         client.command(f"DROP TABLE IF EXISTS {scratch_table}")
 

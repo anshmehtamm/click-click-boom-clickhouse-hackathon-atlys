@@ -25,6 +25,7 @@ class AgentResult:
     output_text: str
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
+    response_id: str | None = None
 
 
 def _base_url() -> str:
@@ -38,13 +39,34 @@ def _headers() -> dict[str, str]:
     }
 
 
-def call_agent(agent_id: str, input_text: str, timeout: int = 120) -> AgentResult:
+def call_agent(agent_id: str, input_text: str, previous_response_id: str | None = None, timeout: int = 120) -> AgentResult:
     """Calls a LibreChat agent (non-streaming) and returns its final text plus any
-    tool calls it made, for unpacking into Langfuse child spans by the caller."""
+    tool calls it made, for unpacking into Langfuse child spans by the caller.
+
+    `previous_response_id` is currently NOT USABLE — confirmed by direct testing,
+    not assumed. The server mints its own internal conversation ID (a UUID) on the
+    first call and stores state under that, but never returns it anywhere in the
+    response (not the body, not headers) — `AgentResult.response_id` (the `resp_xxx`
+    id) is a different, unrelated identifier. Passing it back 404s with "Conversation
+    not found". The only way to get the real ID is reaching into LibreChat's MongoDB
+    directly, which is an internal implementation detail, not a stable API contract
+    — not something to build pipeline reliability on. This is a real gap in the beta
+    API, not something we're doing wrong. Left wired up (accepts the param, sends
+    store=True) in case a future LibreChat version actually returns the ID, but the
+    orchestrator does not currently pass this — every rework round is a genuinely
+    fresh conversation, hence prior_findings + previous_attempt being spelled out
+    explicitly in the prompt payload instead of relied on as remembered context."""
+    # store=True is required for previous_response_id chaining to work at all — it
+    # defaults to False, which silently means nothing is persisted server-side and
+    # every previous_response_id lookup 404s. Found by inspecting a real response
+    # body (it echoes "store": false) after a first chaining attempt failed.
+    payload: dict[str, Any] = {"model": agent_id, "input": input_text, "store": True}
+    if previous_response_id:
+        payload["previous_response_id"] = previous_response_id
     resp = requests.post(
         f"{_base_url()}/api/agents/v1/responses",
         headers=_headers(),
-        json={"model": agent_id, "input": input_text},
+        json=payload,
         timeout=timeout,
     )
     resp.raise_for_status()
@@ -75,6 +97,7 @@ def call_agent(agent_id: str, input_text: str, timeout: int = 120) -> AgentResul
         output_text="\n".join(output_text_parts).strip(),
         tool_calls=tool_calls,
         raw=data,
+        response_id=data.get("id"),
     )
 
 

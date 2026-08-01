@@ -18,7 +18,7 @@ load_dotenv()
 from agents.prompts import AGENTS  # noqa: E402
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-MODEL = "gpt-4o-mini"
+MODEL = "gpt-5.6"
 
 ENV_VAR_BY_AGENT = {
     "instrumentation_proposer": "LIBRECHAT_AGENT_INSTRUMENTATION_PROPOSER",

@@ -121,10 +121,19 @@ Admin panel on `:3000` needs `ADMIN_PANEL_SESSION_SECRET` set or it crash-loops.
 **Fast path**: register manually (one curl call below), put the admin email/password
 into `atlys-agents/.env` (`LIBRECHAT_ADMIN_EMAIL`/`LIBRECHAT_ADMIN_PASSWORD`), then run
 `atlys-agents/.venv/bin/python agents/create_agents.py` — it logs in, creates all 4
-agents from `agents/prompts.py`, generates an Agents API key if you don't have one
-yet, and writes every ID back into `.env` automatically. Re-run it any time you edit a
-prompt in `agents/prompts.py` — it creates fresh agents (LibreChat doesn't have an
-upsert-by-name; old ones are left in place, harmless, or delete via `DELETE /api/agents/:id`).
+agents, generates an Agents API key if you don't have one yet, and writes every ID
+back into `.env` automatically.
+
+Instructions are pulled from Langfuse Prompt Management (the "production"-labeled
+version of each of the 4 prompts), not read directly from `agents/prompts.py` — that
+file's `AGENTS` dict is still the `fallback` passed to `get_prompt()`, so a Langfuse
+outage or an unseeded prompt degrades to that text instead of failing. To edit a
+prompt: change it in Langfuse's UI directly (new version, re-promote the `production`
+label), or edit `agents/prompts.py` and run
+`atlys-agents/.venv/bin/python -m agents.seed_prompts_to_langfuse` to push it up as a
+new version — either way, re-run `create_agents.py` afterward to create fresh agents
+with the updated text (LibreChat doesn't have an upsert-by-name; old ones are left in
+place, harmless, or delete via `DELETE /api/agents/:id`).
 
 The manual steps below are what `create_agents.py` does under the hood — useful if
 you need to debug it or create a one-off agent by hand. **Always send a real

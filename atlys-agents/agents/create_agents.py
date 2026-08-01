@@ -1,9 +1,17 @@
-"""Creates (or re-creates) the 4 real agents in LibreChat from agents/prompts.py,
-generates an Agents API key if one isn't already set, and writes everything back
-into .env. Reproducible — this is why prompts live in code, not just clicked into
-the LibreChat UI.
+"""Creates (or re-creates) the 4 real agents in LibreChat, generates an Agents API
+key if one isn't already set, and writes everything back into .env.
 
-Requires in .env: LIBRECHAT_URL, LIBRECHAT_ADMIN_EMAIL, LIBRECHAT_ADMIN_PASSWORD.
+Instructions are sourced from Langfuse Prompt Management (see
+agents/seed_prompts_to_langfuse.py) — the "production"-labeled version of each
+prompt — with the AGENTS dict in agents/prompts.py as the `fallback` passed to
+get_prompt(). This is a real fallback, not just a name: if Langfuse is unreachable
+or a prompt was never seeded, get_prompt() returns the fallback text directly rather
+than raising, so agent creation never hard-depends on Langfuse being up. Reproducible
+either way — this is why prompts still live in code as well, not just in Langfuse's
+UI or clicked into LibreChat's.
+
+Requires in .env: LIBRECHAT_URL, LIBRECHAT_ADMIN_EMAIL, LIBRECHAT_ADMIN_PASSWORD,
+LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_HOST.
 """
 import pathlib
 import sys
@@ -15,7 +23,10 @@ import os
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 load_dotenv()
 
+from langfuse import get_client  # noqa: E402
+
 from agents.prompts import AGENTS  # noqa: E402
+
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 MODEL = "gpt-5.6-luna"
@@ -41,7 +52,7 @@ def login(base_url: str) -> str:
     return resp.json()["token"]
 
 
-def create_agent(base_url: str, jwt: str, name: str, spec: dict) -> str:
+def create_agent(base_url: str, jwt: str, name: str, spec: dict, instructions: str) -> str:
     resp = requests.post(
         f"{base_url}/api/agents",
         headers={"User-Agent": UA, "Authorization": f"Bearer {jwt}", "Content-Type": "application/json"},
@@ -54,7 +65,7 @@ def create_agent(base_url: str, jwt: str, name: str, spec: dict) -> str:
             # routes gpt-5.6 through the upstream Responses API — otherwise function
             # tools + reasoning 400 on Chat Completions. See agents/prompts.py header.
             "model_parameters": {"model": MODEL, "response_format": {"type": "json_object"}, "reasoning_effort": "low"},
-            "instructions": spec["instructions"],
+            "instructions": instructions,
             "tools": spec.get("tools", []),
             "skills_enabled": spec.get("skills_enabled", False),
         },
@@ -71,6 +82,16 @@ def create_api_key(base_url: str, jwt: str) -> str:
     )
     resp.raise_for_status()
     return resp.json()["key"]
+
+
+def resolve_instructions(langfuse_client, name: str, fallback: str) -> str:
+    """Fetches the "production"-labeled prompt for `name` from Langfuse. Falls back
+    to the hardcoded prompts.py text (returned as-is, no exception) if Langfuse is
+    unreachable or `name` was never seeded via seed_prompts_to_langfuse.py."""
+    prompt = langfuse_client.get_prompt(name, label="production", type="text", fallback=fallback)
+    source = "Langfuse fallback (local text)" if getattr(prompt, "is_fallback", False) else f"Langfuse v{prompt.version}"
+    print(f"  {name}: instructions from {source}")
+    return prompt.prompt
 
 
 def update_env_file(updates: dict):
@@ -93,9 +114,12 @@ def main():
     jwt = login(base_url)
     print("logged in")
 
+    langfuse_client = get_client()
+
     updates = {}
     for name, spec in AGENTS.items():
-        agent_id = create_agent(base_url, jwt, name, spec)
+        instructions = resolve_instructions(langfuse_client, name, spec["instructions"])
+        agent_id = create_agent(base_url, jwt, name, spec, instructions)
         env_var = ENV_VAR_BY_AGENT[name]
         updates[env_var] = agent_id
         print(f"created {name} -> {agent_id}")

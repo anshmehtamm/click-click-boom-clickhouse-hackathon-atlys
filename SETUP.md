@@ -196,6 +196,33 @@ Verify: `docker logs LibreChat | grep -A5 '\[MCP\]\[atlys'` should show both ser
 initialized with their tool lists. Then re-run `agents/create_agents.py` — it attaches
 each agent's tools from `agents/prompts.py`'s `AGENTS[...]["tools"]`.
 
+## 5. ClickHouse Agent Skills (official, encodes exactly the bugs we kept hitting)
+
+```bash
+git clone --depth 1 https://github.com/ClickHouse/agent-skills.git /tmp/agent-skills
+mkdir -p LibreChat/skill
+cp -r /tmp/agent-skills/skills/clickhouse-best-practices LibreChat/skill/
+```
+
+In `librechat.yaml`, add `"skills"` to the agents capabilities list (not in the
+default set):
+
+```yaml
+endpoints:
+  agents:
+    capabilities: ["deferred_tools", "execute_code", "file_search", "actions", "tools", "skills"]
+```
+
+`docker compose restart api`, then check `docker logs LibreChat | grep deploymentSkills`
+— should show `Loaded 1 deployment skill(s) from /app/skill`. Finally, set
+`skills_enabled: true` on the agents that should use it (currently
+`instrumentation_proposer` and `context_reviewer` — see `agents/prompts.py`'s
+`AGENTS` dict) and re-run `agents/create_agents.py`.
+
+Verified working: asked `instrumentation_proposer` directly whether Nullable
+columns belong in an ORDER BY — it called `skill` then `read_file` (×2) and cited
+`schema-types-avoid-nullable` by name in its answer.
+
 ## Gotchas hit while setting this up (save yourself the debugging time)
 
 1. **`librechat.yaml` not mounted by default.** Silent — server logs

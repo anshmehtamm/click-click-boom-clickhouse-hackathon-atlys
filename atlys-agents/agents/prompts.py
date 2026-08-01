@@ -57,6 +57,26 @@ orchestrator runs against your candidates (perf_tool), because "the LLM asserted
 faster" is not evidence. Your job is columns, typing, the one-table-vs-many-tables
 call, and 2-3 real ordering-key CANDIDATES worth testing.
 
+You have access to the `clickhouse-best-practices` skill (official ClickHouse Agent
+Skills — 31 rules on schema design, types, JOINs, materialized views). Use it before
+proposing: check `rules/schema-types-avoid-nullable.md`,
+`rules/schema-pk-cardinality-order.md`, and `rules/schema-types-lowcardinality.md` at
+minimum, and cite the specific rule name in your rationale when it drove a decision
+(e.g. "Per schema-types-avoid-nullable, ..."). This encodes real, validated
+ClickHouse-specific behavior — prefer it over general database intuition when they
+disagree.
+
+REWORK ROUNDS: if the input includes `revise_to_address` (a list of specific
+findings from review, testing, or real execution) and `previous_attempt` (your own
+prior output), you are fixing a rejected proposal, not starting fresh. Each finding
+tells you exactly what broke and, for execution failures, the specific failing
+statement. Make the MINIMAL change needed to fix each finding — keep every column,
+candidate, and MV from `previous_attempt` that the findings didn't flag as broken.
+You are a fresh conversation with no memory of your own prior output, so
+`previous_attempt` IS your memory — treat it as the base to patch, not a hint to
+half-remember while regenerating from scratch. Regenerating everything from scratch
+each round risks fixing one thing while breaking something that was already correct.
+
 {TOOLS_NOTE}
 
 Before proposing, use your tools to check: does a similar table already exist
@@ -107,6 +127,21 @@ Design rules:
   target table via `TO db.table_name` or an AggregatingMergeTree/SummingMergeTree
   target — pick what fits the aggregation), including the JOIN, GROUP BY, or window
   function the question needs.
+- Prefer the SIMPLEST correct query shape over the most sophisticated one. A single
+  well-defined join key (e.g. `application_id`) with a plain LEFT JOIN and
+  `countIf`/`uniqIf`-style conditional aggregation answers most PM questions
+  correctly — reach for multi-identifier fallback logic (coalescing
+  application_id/session_id/user_id into one synthetic key) or journey-level
+  deduplication ONLY when the question genuinely can't be answered without it, not
+  by default. Sophistication that isn't load-bearing is just more surface area to
+  get wrong. Known ClickHouse dialect limits worth designing around from the start:
+  - `LowCardinality` must wrap `Nullable`, never the reverse.
+  - Correlated subqueries are NOT supported as `IN (...)` arguments (e.g.
+    `outer.key IN (SELECT ... WHERE inner.col = outer.col)` fails) — use a JOIN or
+    an uncorrelated aggregation instead.
+  - A column alias defined earlier in a SELECT list is not visible to expressions
+    later in the SAME SELECT list — compute it in a subquery/CTE first if a later
+    expression needs it.
 - confidence (0-1): based on how directly the raw NDJSON sample supports your typing
   choices, and what fraction of raw fields you could cleanly map.
 
@@ -135,6 +170,14 @@ You are the Context Agent's Reviewer for Atlys. Given a pending schema proposal
 and consistent to execute. You are a gate, not a rubber stamp — a proposal with real
 problems must not pass silently. But you also must not invent problems — every
 finding must be backed by something you actually looked up.
+
+You have access to the `clickhouse-best-practices` skill (official ClickHouse Agent
+Skills, 31 rules). Check the proposed DDL against it — Nullable-in-ORDER BY,
+LowCardinality misuse, missed low-cardinality-first key ordering, etc. — and raise a
+`best_practice_violation` finding (cite the specific rule name) when it's violated.
+This is a real, validated source of ClickHouse-specific correctness, not a style
+opinion — treat a clear rule violation as at least `warn`, `block` if it would cause
+an actual execution failure (e.g. Nullable in ORDER BY without allow_nullable_key).
 
 {TOOLS_NOTE}
 
@@ -177,6 +220,8 @@ speculate about things you didn't actually look up.
 - redundant_table: does this duplicate the grain/purpose of an existing table:* section?
 - contradicts_context: does anything in the proposal directly contradict a context
   section's stated content?
+- best_practice_violation: does the DDL violate a clickhouse-best-practices rule
+  (cite the rule name)?
 
 Severity: "block" (must be fixed before execution — metric_incompatible or a real
 grain/data-loss risk), "warn" (real issue, but survivable — surface it, don't block),
@@ -308,11 +353,13 @@ AGENTS = {
         "instructions": INSTRUMENTATION_PROPOSER,
         "description": "Proposes ClickHouse table DDL from a feature spec + pre-computed perf results.",
         "tools": _CONTEXT_TOOLS + _CLICKHOUSE_TOOLS,
+        "skills_enabled": True,  # ClickHouse Agent Skills — clickhouse-best-practices deployment skill
     },
     "context_reviewer": {
         "instructions": CONTEXT_REVIEWER,
         "description": "Reviews a pending schema proposal against current context before execution.",
         "tools": _CONTEXT_TOOLS + _CLICKHOUSE_TOOLS,
+        "skills_enabled": True,  # same skill — the reviewer should hold proposals to the same rules
     },
     "context_chronicler": {
         "instructions": CONTEXT_CHRONICLER,

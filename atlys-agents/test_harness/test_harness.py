@@ -92,7 +92,13 @@ def run_new_table_tests(
     materialized_views: list[dict] | None = None,
     scratch_db: str = "atlys_staging",
 ) -> TestSuiteResult:
-    client = get_client(database="default")
+    # database="atlys", not "default": MVs legitimately JOIN against existing real
+    # tables using bare (unqualified) names, assuming the connection's default
+    # database is atlys — matches how the agent reasons about it via list_tables.
+    # A "default" client would fail to resolve those bare references even though
+    # the SQL itself is completely correct. Caught by a real test failure, not
+    # anticipated — see the express_checkout_events run that hit exactly this.
+    client = get_client(database="atlys")
     client.command(f"CREATE DATABASE IF NOT EXISTS {scratch_db}")
     scratch_table = f"{scratch_db}.{table_name}__testharness__{uuid.uuid4().hex[:6]}"
     results: list[TestResult] = []

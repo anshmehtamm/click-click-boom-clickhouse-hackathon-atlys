@@ -160,10 +160,16 @@ def _log_agent_call(run, step: str, input_summary, result, **metadata):
     run.log(step=f"{step}_summary", input=input_summary, output=span_summary)
 
 
-def _propose(run, spec_name: str, spec_markdown: str, sample_events: list[dict], prior_findings: list[dict] | None) -> dict:
+def _propose(run, spec_name: str, spec_markdown: str, sample_events: list[dict], prior_findings: list[dict] | None, previous_draft: dict | None) -> dict:
     payload = {"spec_markdown": spec_markdown, "sample_events": sample_events}
     if prior_findings:
+        # previous_draft matters as much as the findings: each call to this agent
+        # is a fresh conversation with no memory of its own prior output (no
+        # previous_response_id chaining), so without the actual previous DDL/MVs it
+        # can only regenerate blind — re-guessing everything, not patching the one
+        # thing that was wrong, which risks introducing a NEW issue elsewhere.
         payload["revise_to_address"] = prior_findings
+        payload["previous_attempt"] = previous_draft
     r = call_agent(os.environ["LIBRECHAT_AGENT_INSTRUMENTATION_PROPOSER"], json.dumps(payload))
     _log_agent_call(run, "propose", {"spec_name": spec_name, "n_sample_events": len(sample_events)}, r)
     return _extract_json(r.output_text)
@@ -192,12 +198,14 @@ def ingest_spec(spec_name: str, spec_markdown: str, sample_events: list[dict], p
     with traced_run(agent="pipeline", spec=spec_name) as run:
         revision = 0
         prior_findings = None
+        previous_draft = None
         proposal_id = None
         final_proposal = None
         final_review = None
 
         while True:
-            draft = _propose(run, spec_name, spec_markdown, sample_events, prior_findings)
+            draft = _propose(run, spec_name, spec_markdown, sample_events, prior_findings, previous_draft)
+            previous_draft = draft
             flattened_events = _flatten_events(sample_events, draft.get("column_mapping", {}))
 
             with run.span("perf_evaluation", revision=revision):
@@ -308,9 +316,19 @@ def ingest_spec(spec_name: str, spec_markdown: str, sample_events: list[dict], p
             # (e.g. an MV's own ORDER BY using a Nullable column) — bounded
             # feed-back-and-retry handles unknown failure modes generically instead
             # of us hand-patching every possible DDL quirk in advance.
+            # (label, statement) tracked as we go so the except handler can pinpoint
+            # exactly which statement failed — with several MVs each potentially
+            # multi-statement, "execution failed: <ClickHouse error>" alone doesn't
+            # tell the model WHICH one, and ClickHouse's own error text often
+            # doesn't name the table/column either (e.g. "Sorting key contains
+            # nullable columns" — that's it, no identifiers). Without this, a
+            # rework round can't reliably tell which MV to fix and may leave the
+            # actual culprit untouched while "fixing" something else.
+            executing: tuple[str, str] | None = None
             try:
                 with run.span("execute"):
                     data_client = get_client(database="atlys")
+                    executing = ("base table", final_proposal["ddl"])
                     data_client.command(final_proposal["ddl"])
                     for mv in final_proposal.get("materialized_views", []):
                         # Some MVs are 2 statements: a backing table (for a `TO`
@@ -320,6 +338,7 @@ def ingest_spec(spec_name: str, spec_markdown: str, sample_events: list[dict], p
                         for stmt in mv["ddl"].split(";"):
                             stmt = stmt.strip()
                             if stmt:
+                                executing = (mv.get("name", "unnamed MV"), stmt)
                                 data_client.command(stmt)
                     if final_flattened_events:
                         body = "\n".join(json.dumps(r, default=str) for r in final_flattened_events).encode()
@@ -329,7 +348,8 @@ def ingest_spec(spec_name: str, spec_markdown: str, sample_events: list[dict], p
                         )
                     run.log(step="executed", input=None, output={"table": f"atlys.{final_proposal['table_name']}"})
             except Exception as e:
-                run.log(step="execute_error", input=final_proposal["ddl"], output=str(e))
+                failed_label, failed_stmt = executing or ("unknown", "")
+                run.log(step="execute_error", input={"failed_object": failed_label, "statement": failed_stmt}, output=str(e))
                 data_client.command(f"DROP TABLE IF EXISTS atlys.{final_proposal['table_name']}")
                 for mv in final_proposal.get("materialized_views", []):
                     if mv.get("name"):
@@ -341,8 +361,8 @@ def ingest_spec(spec_name: str, spec_markdown: str, sample_events: list[dict], p
                 revision += 1
                 prior_findings = [{
                     "severity": "block", "category": "invalid_ddl",
-                    "description": f"Real execution against ClickHouse failed: {e}",
-                    "suggested_fix": "Fix the DDL error (check ORDER BY doesn't reference Nullable columns, multi-statement DDLs are correctly separated, etc.) and resubmit.",
+                    "description": f"Real execution against ClickHouse failed on '{failed_label}'. Failing statement: {failed_stmt}\nError: {e}",
+                    "suggested_fix": "Fix ONLY the failing statement identified above (e.g. if it's an ORDER BY referencing a Nullable column, fix that column's typing or the ordering key) — keep everything else from previous_attempt unchanged unless it's also actually wrong.",
                 }]
                 _update_proposal_status(meta_client, proposal_id, status="needs_rework", revision=revision)
                 continue

@@ -18,7 +18,7 @@ load_dotenv()
 from agents.prompts import AGENTS  # noqa: E402
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-MODEL = "gpt-5.6"
+MODEL = "gpt-5.6-luna"
 
 ENV_VAR_BY_AGENT = {
     "instrumentation_proposer": "LIBRECHAT_AGENT_INSTRUMENTATION_PROPOSER",
@@ -56,6 +56,7 @@ def create_agent(base_url: str, jwt: str, name: str, spec: dict) -> str:
             "model_parameters": {"model": MODEL, "response_format": {"type": "json_object"}, "reasoning_effort": "low"},
             "instructions": spec["instructions"],
             "tools": spec.get("tools", []),
+            "skills_enabled": spec.get("skills_enabled", False),
         },
     )
     resp.raise_for_status()

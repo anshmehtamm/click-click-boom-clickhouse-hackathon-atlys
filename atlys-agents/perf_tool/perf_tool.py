@@ -97,7 +97,10 @@ def run_perf_test(
                     access patterns this table actually needs to serve (time-range
                     filter, segment GROUP BY, funnel-style join, etc.)
     """
-    client = get_client(database="default")
+    # database="atlys" (not "default") for the same reason as test_harness: query
+    # patterns could reference existing real tables by bare name, which only
+    # resolves correctly if that's the connection's default database.
+    client = get_client(database="atlys")
     client.command(f"CREATE DATABASE IF NOT EXISTS {scratch_db}")
 
     all_candidates = list(candidates)

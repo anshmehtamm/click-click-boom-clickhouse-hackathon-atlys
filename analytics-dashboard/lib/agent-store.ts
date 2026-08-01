@@ -5,7 +5,7 @@ export interface AgentEvent {
   agent: string;
   spec: string;
   step: string;
-  status: 'running' | 'done' | 'error' | 'waiting_approval';
+  status: 'running' | 'done' | 'error';
   message: string;
   trace_url?: string;
   proposal_id?: string;

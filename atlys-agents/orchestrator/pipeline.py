@@ -183,10 +183,19 @@ def _build_perf_query_patterns(columns_ddl: str) -> list[str]:
     return patterns
 
 
-def _log_agent_call(run, step: str, input_data, result, **metadata):
+def _log_agent_call(run, step: str, input_data, result, reasoning: str | None = None, **metadata):
     """Logs the call as a span with its own nested child span per tool call the agent
     actually made — so a judge opening the trace sees the real reasoning chain (which
-    tools, what args, in what order), not one opaque call."""
+    tools, what args, in what order), not one opaque call.
+
+    `reasoning`: LibreChat's Agents API (beta) does not surface model reasoning/thinking
+    content at all right now — confirmed via direct testing, including with an explicit
+    `reasoning.summary: "auto"` request param, which still returns no reasoning item in
+    the output array. The closest real analog is the agent's OWN stated rationale inside
+    its structured JSON response (e.g. the proposer's `rationale` field, or the
+    reviewer's `verdict` + finding descriptions) — callers extract that and pass it
+    through here so it surfaces as the one-line preview under the step, same as any
+    other reasoning would."""
     with run.span(step, **metadata) as span:
         # Log the main LLM generation with full input/output and usage
         run.log(
@@ -194,6 +203,7 @@ def _log_agent_call(run, step: str, input_data, result, **metadata):
             input=input_data,
             output=result.output_text,  # Full output, not truncated
             usage=result.usage if result.usage else None,
+            reasoning=reasoning,
             n_tool_calls=len(result.tool_calls)
         )
         # Log each tool call separately for detailed tracing
@@ -233,21 +243,28 @@ def _propose(run, spec_name: str, spec_markdown: str, sample_events: list[dict],
         payload["revise_to_address"] = prior_findings
         payload["previous_attempt"] = previous_draft
     result, r = _call_json_agent(os.environ["LIBRECHAT_AGENT_INSTRUMENTATION_PROPOSER"], payload)
-    _log_agent_call(run, "propose", payload, r, spec_name=spec_name)
+    _log_agent_call(run, "propose", payload, r, reasoning=result.get("rationale"), spec_name=spec_name)
     return result
 
 
 def _review(run, proposal: dict) -> dict:
     payload = {"proposal": proposal}
     result, r = _call_json_agent(os.environ["LIBRECHAT_AGENT_CONTEXT_REVIEWER"], payload)
-    _log_agent_call(run, "review", payload, r, table_name=proposal.get("table_name"))
+    findings_summary = "; ".join(
+        f"[{f.get('severity')}] {f.get('description')}" for f in result.get("findings", [])
+    )
+    reasoning = f"{result.get('verdict', '?')}" + (f" — {findings_summary}" if findings_summary else "")
+    _log_agent_call(run, "review", payload, r, reasoning=reasoning, table_name=proposal.get("table_name"))
     return result
 
 
 def _chronicle(run, executed_proposal: dict, spec_name: str) -> dict:
     payload = {"executed_proposal": executed_proposal, "spec_name": spec_name}
     result, r = _call_json_agent(os.environ["LIBRECHAT_AGENT_CONTEXT_CHRONICLER"], payload)
-    _log_agent_call(run, "chronicle", payload, r, table_name=executed_proposal.get("table_name"), spec_name=spec_name)
+    sections_summary = "; ".join(
+        f"{s.get('section')}: {s.get('diff_summary')}" for s in result.get("sections", [])
+    )
+    _log_agent_call(run, "chronicle", payload, r, reasoning=sections_summary or None, table_name=executed_proposal.get("table_name"), spec_name=spec_name)
     return result
 
 
@@ -383,7 +400,20 @@ def ingest_spec(spec_name: str, spec_markdown: str, sample_events: list[dict], p
                     sample_rows=final_flattened_events, smoke_queries=smoke_queries,
                     materialized_views=final_proposal.get("materialized_views", []),
                 )
-                run.log(step="test_harness_result", input=None, output={"passed": suite.passed, "results": [r.__dict__ for r in suite.results]})
+                # Log only failures to the trace, not the full suite (which is mostly
+                # passes) — this is a readability fix for the trace/dashboard, not a
+                # behavior change: the LLM below (prior_findings) has ALWAYS only ever
+                # received the failures list, never the full suite. Full results remain
+                # in agent_meta.test_runs for anyone who needs the complete picture.
+                run.log(
+                    step="test_harness_result", input=None,
+                    output={
+                        "passed": suite.passed,
+                        "n_passed": sum(1 for r in suite.results if r.passed),
+                        "n_total": len(suite.results),
+                        "failures": [r.__dict__ for r in suite.results if not r.passed],
+                    },
+                )
                 if not suite.passed:
                     if at_cap:
                         _update_proposal_status(meta_client, proposal_id, status="needs_rework")

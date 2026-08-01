@@ -87,6 +87,50 @@
   .kind-span .step { color: var(--text-dim); font-style: italic; }
   .kind-trace .step { color: var(--accent); font-weight: 600; }
 
+  .agent-badge {
+    display: inline-block; font-size: 9.5px; font-family: var(--mono); letter-spacing: 0.02em;
+    padding: 1px 6px; border-radius: 4px; margin-right: 7px; white-space: nowrap; vertical-align: 1px;
+  }
+  .agent-proposer  { background: #2a2140; color: var(--violet); }
+  .agent-reviewer  { background: #142d3d; color: #7dd3fc; }
+  .agent-chronicler{ background: #3a1f2e; color: #f0a8c8; }
+  .agent-pipeline  { background: var(--panel-2); color: var(--text-dim); }
+
+  /* tool-type badges: one per real tool family, colored so the tool-call chain's
+     shape (which systems the agent touched, in what order) reads at a glance */
+  .tool-badge {
+    display: inline-flex; align-items: center; gap: 4px; font-size: 9.5px;
+    font-family: var(--mono); letter-spacing: 0.02em; padding: 1px 6px 1px 5px;
+    border-radius: 4px; margin-right: 7px; white-space: nowrap; vertical-align: 1px;
+  }
+  .tool-context  { background: #0f2e33; color: #5eead4; }
+  .tool-schema   { background: #332708; color: var(--amber); }
+  .tool-query    { background: #3d2408; color: #ffb454; }
+  .tool-scratch  { background: #2a2410; color: #d8c27a; }
+  .tool-python   { background: #12321c; color: #7ee08a; }
+  .tool-skill    { background: #241a38; color: #c8a8f0; }
+  .tool-file     { background: #241f14; color: #ceb87a; }
+  .tool-generic  { background: var(--panel-2); color: var(--text-dim); }
+
+  .no-output { color: var(--text-dim); font-style: italic; }
+
+  /* thinking/reasoning callout: the closest real signal we have to "thinking" is
+     each agent's own stated rationale in its structured JSON output (LibreChat's
+     Agents API returns no raw reasoning/thinking content at all -- confirmed via
+     direct testing in streaming, non-streaming, and with an explicit
+     reasoning.summary=auto request param, none of which surfaced anything).
+     Styled as a distinct callout so it reads as "the agent's reasoning", labeled
+     honestly rather than implying raw chain-of-thought. */
+  .thinking {
+    margin-top: 5px; padding: 7px 10px; border-left: 2px solid var(--violet);
+    background: #17122a; border-radius: 0 6px 6px 0; font-size: 12px;
+    color: #cfc4ea; line-height: 1.5; white-space: pre-wrap;
+  }
+  .thinking .label {
+    display: block; font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.05em;
+    color: var(--violet); margin-bottom: 3px; font-family: var(--mono);
+  }
+
   .detail {
     grid-column: 1 / -1; margin: 6px 0 6px 88px; padding: 10px 12px;
     background: #0d1016; border: 1px solid var(--border); border-radius: 6px;
@@ -124,6 +168,43 @@
 
 <script>
 const ICONS = { trace: "◆", span: "›", generation: "✦", tool_call: "⚙", log: "·" };
+
+// The whole spec ingestion is ONE Langfuse trace by design (coherent single trace
+// beats 4 disconnected ones) -- but that means "which of the 4 real LLM agents is
+// this row" isn't visible from trace grouping alone. Steps are named by pipeline
+// stage (propose/review/chronicle/...), which maps 1:1 to a real agent; badge each
+// row with that mapping so e.g. "context reviewer" activity is visually distinct
+// even though it lives inside the same trace as everything else.
+function agentBadge(step) {
+  if (step.startsWith("propose")) return ["Instrumentation Proposer", "agent-proposer"];
+  if (step.startsWith("review")) return ["Context Reviewer", "agent-reviewer"];
+  if (step.startsWith("chronicle")) return ["Context Chronicler", "agent-chronicler"];
+  return ["Pipeline", "agent-pipeline"];
+}
+
+// Real tool families in this pipeline (see agents/prompts.py TOOLS_NOTE /
+// mcp_servers/*.py) -- names come straight from LibreChat's function_call.name,
+// which IS real (unlike arguments/output, confirmed absent from the API). Ordered
+// most-specific-prefix-first since e.g. "list_context_sections" and "list_tables"
+// both start with "list_".
+const TOOL_TYPES = [
+  { test: n => n === "skill",                                    icon: "📘", label: "Skill",         cls: "tool-skill" },
+  { test: n => n.startsWith("read_file"),                        icon: "📄", label: "File Read",     cls: "tool-file" },
+  { test: n => n.startsWith("list_context_sections") || n.startsWith("lookup_context"),
+                                                                   icon: "🗂", label: "Context Layer", cls: "tool-context" },
+  { test: n => n.startsWith("run_query"),                        icon: "▶", label: "ClickHouse Query", cls: "tool-query" },
+  { test: n => n.startsWith("list_tables") || n.startsWith("describe_table"),
+                                                                   icon: "🛢", label: "ClickHouse Schema", cls: "tool-schema" },
+  { test: n => n.startsWith("grep_scratch") || n.startsWith("read_scratch"),
+                                                                   icon: "📜", label: "Scratch File",  cls: "tool-scratch" },
+  { test: n => n.startsWith("execute_python"),                   icon: "🐍", label: "Python",        cls: "tool-python" },
+];
+
+function classifyTool(rawName) {
+  const name = (rawName || "").replace(/_mcp_atlys_(context|data)$/, "");
+  const match = TOOL_TYPES.find(t => t.test(name));
+  return { name, ...(match || { icon: "⚙", label: "Tool", cls: "tool-generic" }) };
+}
 
 let traces = {};      // trace_id -> {agent, spec, url, events: [], done}
 let activeTrace = null;
@@ -170,15 +251,19 @@ function renderTraceList() {
   }
 }
 
+function toolCallInfo(ev) {
+  const m = (ev.step || "").match(/_tool\[(\d+)\]_(.+)$/);
+  if (!m) return null;
+  return { index: m[1], ...classifyTool(m[2]) };
+}
+
 function eventLabel(ev) {
   if (ev.event === "trace_start") return `trace: ${ev.agent}:${ev.spec}`;
   if (ev.event === "trace_end") return `trace complete`;
   if (ev.event === "span_start") return `▶ ${ev.step}`;
   if (ev.event === "span_end") return `◀ ${ev.step}`;
-  if (ev.kind === "tool_call") {
-    const m = ev.step.match(/_tool\[\d+\]_(.+)$/);
-    return m ? `tool → ${m[1]}` : ev.step;
-  }
+  const tool = toolCallInfo(ev);
+  if (tool) return `<span class="tool-badge ${tool.cls}">${tool.icon} ${tool.label}</span>${tool.name}`;
   return ev.step;
 }
 
@@ -187,12 +272,20 @@ function renderRow(ev, idx) {
   row.className = "row kind-" + (ev.kind || "log");
   const icon = ICONS[ev.kind] || "·";
   const usage = ev.usage ? `${ev.usage.total ?? ""} tok` : "";
+  const [badgeLabel, badgeClass] = agentBadge(ev.step || "");
+  // Thinking callout: only on generation rows (the agent's own stated rationale,
+  // extracted from its structured JSON output by orchestrator/pipeline.py) --
+  // always visible, not hidden behind expand, since this is the actual "thinking"
+  // signal being asked for.
+  const thinkingHtml = (ev.kind === "generation" && ev.reasoning)
+    ? `<div class="thinking"><span class="label">💭 agent's stated reasoning</span>${truncate(ev.reasoning, 600)}</div>`
+    : "";
   row.innerHTML = `
     <div class="t">${fmtTime(ev.ts)}</div>
     <div class="icon">${icon}</div>
     <div class="body">
-      <div class="step">${eventLabel(ev)}</div>
-      ${ev.reasoning ? `<div class="reasoning">${ev.reasoning}</div>` : ""}
+      <div class="step"><span class="agent-badge ${badgeClass}">${badgeLabel}</span>${eventLabel(ev)}</div>
+      ${thinkingHtml}
     </div>
     <div class="usage">${usage}</div>
   `;
@@ -200,8 +293,20 @@ function renderRow(ev, idx) {
   detail.className = "detail";
   detail.style.display = "none";
   const parts = [];
-  if (ev.input != null) parts.push(`<span class="k">input</span>\n${truncate(ev.input)}`);
-  if (ev.output != null) parts.push(`<span class="k">output</span>\n${truncate(ev.output)}`);
+  const tool = toolCallInfo(ev);
+  if (tool) {
+    parts.push(
+      `<span class="k">tool</span>\n${tool.name}  (type: ${tool.label}, call #${tool.index} in this agent turn)\n\n` +
+      `<span class="no-output">Arguments and output are not shown — LibreChat's Agents API (beta) never returns ` +
+      `function_call arguments or a function_call_output item for any tool call (confirmed empirically across ` +
+      `non-streaming, streaming, and streaming-with-reasoning-param requests). The tool name and call order above ` +
+      `are real; the payload isn't recoverable from this API today. This is a beta API gap, not a bug in this pipeline.</span>`
+    );
+  } else {
+    if (ev.reasoning) parts.push(`<span class="k">reasoning (full)</span>\n${truncate(ev.reasoning, 4000)}`);
+    if (ev.input != null) parts.push(`<span class="k">input</span>\n${truncate(ev.input)}`);
+    if (ev.output != null) parts.push(`<span class="k">output</span>\n${truncate(ev.output)}`);
+  }
   if (ev.metadata && Object.keys(ev.metadata).length) parts.push(`<span class="k">metadata</span>\n${truncate(ev.metadata)}`);
   if (ev.usage) parts.push(`<span class="k">usage</span>\n${truncate(ev.usage)}`);
   detail.innerHTML = parts.join("\n\n") || "(no detail)";

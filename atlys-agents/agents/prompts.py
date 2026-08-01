@@ -127,6 +127,15 @@ Design rules:
   target table via `TO db.table_name` or an AggregatingMergeTree/SummingMergeTree
   target — pick what fits the aggregation), including the JOIN, GROUP BY, or window
   function the question needs.
+- The SAME rule that applies to the base table's ordering key applies to every MV
+  TARGET table's ORDER BY too: it must be built ONLY from non-Nullable columns
+  (ClickHouse rejects Nullable in ORDER BY without `allow_nullable_key`, which you
+  must not rely on). Group-by/dimension columns pulled from Nullable source columns
+  (e.g. `device_type`, `geoip_country_code`) are the usual offenders — wrap them with
+  `ifNull(col, '')` in the SELECT and declare the corresponding target-table column as
+  non-Nullable (plain `String` or `LowCardinality(String)`, not `Nullable(...)`).
+  Check every column in every MV target's ORDER BY against this before finalizing —
+  this applies per-MV, not just to the first one.
 - Prefer the SIMPLEST correct query shape over the most sophisticated one. A single
   well-defined join key (e.g. `application_id`) with a plain LEFT JOIN and
   `countIf`/`uniqIf`-style conditional aggregation answers most PM questions

@@ -24,10 +24,25 @@ export async function POST(request: NextRequest) {
 
     // Parse events from NDJSON file
     const eventsText = await eventsFile.text();
-    const events = eventsText
+    const allEvents = eventsText
       .split('\n')
       .filter(line => line.trim())
       .map(line => JSON.parse(line));
+
+    // Stratified sample, capped per event type (same PER_EVENT_SAMPLE=30 convention
+    // as scripts/run_*.py) — the raw file can be thousands of rows, and sending that
+    // whole thing as the propose payload blows the agent's context window entirely
+    // (measured: a 6237-row unsampled file produced a >10M-token single message,
+    // which LibreChat prunes to empty and then 500s on). The proposer only needs a
+    // representative sample of each event's shape, not the full volume.
+    const PER_EVENT_SAMPLE = 30;
+    const byEventType = new Map<string, any[]>();
+    for (const e of allEvents) {
+      const key = e.event ?? 'unknown';
+      const arr = byEventType.get(key) ?? [];
+      if (arr.length < PER_EVENT_SAMPLE) { arr.push(e); byEventType.set(key, arr); }
+    }
+    const events = [...byEventType.values()].flat();
 
     if (events.length === 0) {
       const encoder = new TextEncoder();

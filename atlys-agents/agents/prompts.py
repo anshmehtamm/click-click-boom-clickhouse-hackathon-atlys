@@ -162,12 +162,14 @@ Design rules:
   low-cardinality, Nullable must be the inner type.
 - `columns_ddl` is ONLY the column definitions (no ENGINE/PARTITION/ORDER BY) — the
   orchestrator appends those once perf_tool picks a winner among your candidates.
-  Do NOT write `CREATE TABLE ...` yourself and do NOT wrap the whole thing in an
-  outer `(...)` — just the comma-separated column defs, e.g.
+  Do NOT write `CREATE TABLE ...` yourself, do NOT wrap the whole thing in an
+  outer `(...)`, and do NOT append `ENGINE = ...`/`PARTITION BY ...`/
+  `ORDER BY ...`/`SETTINGS ...` at the end either (seen on a real run: the model
+  dropped the `CREATE TABLE` head but still tacked the `ENGINE` tail onto the
+  column list) — just the bare comma-separated column defs, e.g.
   `event_id String, event_time DateTime64(3, 'UTC'), user_id String DEFAULT ''`.
   The orchestrator builds `CREATE TABLE <table_name> (<columns_ddl>) ENGINE = ...`
-  itself; if columns_ddl already contains that wrapper, the result is a broken
-  double-wrapped statement.
+  itself; any of the above produces a broken, double-wrapped statement.
 - Propose 2-3 `ordering_key_candidates`. Every candidate's ordering key must be built
   ONLY from non-Nullable columns (ClickHouse disallows Nullable in ORDER BY without a
   hygiene-degrading setting) — pick from id/timestamp/user_id/application_id or any
@@ -276,7 +278,7 @@ inside the JSON — not as prose around it.
 
 Output ONLY this JSON object:
 {{
-  "table_name": "string, snake_case",
+  "table_name": "string, snake_case, UNQUALIFIED -- no 'atlys.' or any database prefix, just the bare table name (the orchestrator adds the database qualifier itself wherever one is needed)",
   "columns_ddl": "column definitions only, comma-separated, no ENGINE/ORDER BY",
   "ordering_key_candidates": [
     {{"label": "short_label", "ordering_key": "(col_a, col_b)", "partition_key": "toYYYYMM(timestamp)", "rationale": "what access pattern this favors"}}

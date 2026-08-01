@@ -335,6 +335,17 @@ def ingest_spec(
                 }], revision)
                 continue
 
+            # Defensive normalization: a real run had the proposer write
+            # table_name as "atlys.group_application_events" (schema-qualified)
+            # instead of bare. perf_tool builds scratch tables as
+            # "{scratch_db}.{table_name}__{label}__{hex}" -- a qualified
+            # table_name then produces a 3-segment identifier
+            # ("atlys_staging.atlys.group_application_events__...") which
+            # ClickHouse's parser rejects outright (a table identifier is at
+            # most database.table). Keep only the last dot-separated segment.
+            if "." in draft.get("table_name", ""):
+                draft["table_name"] = draft["table_name"].rsplit(".", 1)[-1]
+
             # Defensive normalization: the schema says columns_ddl is "column
             # definitions only... no ENGINE/ORDER BY" (i.e. no surrounding
             # parens either), but a real run wrapped it in an extra outer `(...)`
@@ -363,8 +374,25 @@ def ingest_spec(
             m = re.search(r"CREATE\s+TABLE\b.*?\((.*)\)\s*ENGINE\b", cols, re.IGNORECASE | re.DOTALL)
             if m:
                 cols = m.group(1).strip()
+            else:
+                # A DIFFERENT real failure mode (same run, later revisions): no
+                # leading CREATE TABLE this time, but the ENGINE/PARTITION BY/
+                # ORDER BY/SETTINGS tail still leaked directly onto otherwise-bare
+                # column defs. Cut everything from ENGINE onward.
+                tail = re.search(r"\bENGINE\s*=", cols, re.IGNORECASE)
+                if tail:
+                    cols = cols[: tail.start()].strip()
             if cols.startswith("(") and cols.endswith(")"):
                 cols = cols[1:-1].strip()
+            # Whichever branch fired can leave one unmatched trailing ")" — the
+            # model's own accidental close of a CREATE TABLE wrapper it otherwise
+            # never fully wrote (e.g. "...CHECK length(x) > 0\n)\nENGINE..." — the
+            # tail-cut above removes "ENGINE..." but leaves that stray "\n)").
+            # Every real column-type paren (LowCardinality(String), CHECK(...))
+            # opens and closes within the same column, so a genuinely balanced
+            # columns_ddl has equal counts.
+            if cols.count(")") > cols.count("(") and cols.endswith(")"):
+                cols = cols[:-1].strip().rstrip(",").strip()
             draft["columns_ddl"] = cols
 
             previous_draft = draft
@@ -573,6 +601,11 @@ def ingest_spec(
             if review["verdict"] != "approve" and not at_cap:
                 revision += 1
                 prior_findings = _record_findings(finding_history, review["findings"], revision)
+                run.log(
+                    step="review_feedback_to_proposer",
+                    input={"verdict": review["verdict"]},
+                    output={"revision": revision, "findings_sent_to_proposer": prior_findings[-MAX_FINDINGS_IN_PAYLOAD:]},
+                )
                 _update_proposal_status(meta_client, proposal_id, status="needs_rework", revision=revision)
                 continue
             if review["verdict"] != "approve":

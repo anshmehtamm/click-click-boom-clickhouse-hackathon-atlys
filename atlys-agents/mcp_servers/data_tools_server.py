@@ -143,7 +143,17 @@ def grep_scratch(scratch_file: str, pattern: str, max_matches: int = 30) -> list
     """Greps a file saved by run_query for a regex pattern, returning matching
     lines only (case-insensitive). Use this instead of read_scratch when you're
     looking for something specific rather than browsing."""
+    # run_query's scratch_file pointer is an absolute path, but the proposer's
+    # OWN sample_events pointer (orchestrator/pipeline.py's
+    # _write_sample_scratch_file) is a bare filename -- execute_python's
+    # subprocess runs with cwd=SCRATCH_DIR so a bare name works there, but a
+    # relative Path is never is_relative_to an absolute SCRATCH_DIR, so callers
+    # passing that same bare filename here always 400'd even though the file
+    # genuinely exists. Resolve relative to SCRATCH_DIR before checking.
     path = pathlib.Path(scratch_file)
+    if not path.is_absolute():
+        path = SCRATCH_DIR / path
+    path = path.resolve()
     if not path.is_relative_to(SCRATCH_DIR):
         raise ValueError("scratch_file must be a path returned by run_query")
     regex = re.compile(pattern, re.IGNORECASE)
@@ -157,7 +167,17 @@ def read_scratch(scratch_file: str, start_line: int = 0, n_lines: int = 50) -> l
     start_line. Use this to browse when grep_scratch's pattern search isn't what
     you need."""
     n_lines = min(n_lines, MAX_LINES_RETURNED)
+    # run_query's scratch_file pointer is an absolute path, but the proposer's
+    # OWN sample_events pointer (orchestrator/pipeline.py's
+    # _write_sample_scratch_file) is a bare filename -- execute_python's
+    # subprocess runs with cwd=SCRATCH_DIR so a bare name works there, but a
+    # relative Path is never is_relative_to an absolute SCRATCH_DIR, so callers
+    # passing that same bare filename here always 400'd even though the file
+    # genuinely exists. Resolve relative to SCRATCH_DIR before checking.
     path = pathlib.Path(scratch_file)
+    if not path.is_absolute():
+        path = SCRATCH_DIR / path
+    path = path.resolve()
     if not path.is_relative_to(SCRATCH_DIR):
         raise ValueError("scratch_file must be a path returned by run_query")
     lines = path.read_text().splitlines()

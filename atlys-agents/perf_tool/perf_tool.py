@@ -181,7 +181,16 @@ def run_perf_test(
             # AllCandidatesFailedError below with the details for rework.
             errors[cand.label] = str(e)
         finally:
-            client.command(f"DROP TABLE IF EXISTS {scratch_table}")
+            # Best-effort cleanup -- must never itself crash the pipeline. A real
+            # run hit exactly this: a malformed scratch_table identifier (from a
+            # bad table_name upstream) made even DROP TABLE IF EXISTS fail with a
+            # SYNTAX_ERROR, which (uncaught here) replaced the original, more
+            # informative CREATE/INSERT failure and took down the whole run
+            # instead of being recorded as this candidate's error.
+            try:
+                client.command(f"DROP TABLE IF EXISTS {scratch_table}")
+            except Exception as cleanup_err:
+                errors.setdefault(cand.label, f"(scratch cleanup also failed: {cleanup_err})")
 
     if not reports:
         raise AllCandidatesFailedError(errors)

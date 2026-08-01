@@ -67,12 +67,14 @@ export async function POST(request: NextRequest) {
         // Write events + spec to temp JSON files — avoids JSON→Python literal mismatch
         // (JSON false/true/null ≠ Python False/True/None)
         const ts = Date.now();
-        const tmpEventsPath  = path.join('/tmp', `events_${ts}.json`);
-        const tmpSpecPath    = path.join('/tmp', `spec_${ts}.md`);
-        const tmpScriptPath  = path.join('/tmp', `ingest_${ts}.py`);
+        const tmpEventsPath     = path.join('/tmp', `events_${ts}.json`);
+        const tmpFullEventsPath = path.join('/tmp', `full_events_${ts}.json`);
+        const tmpSpecPath       = path.join('/tmp', `spec_${ts}.md`);
+        const tmpScriptPath     = path.join('/tmp', `ingest_${ts}.py`);
 
-        fs.writeFileSync(tmpEventsPath,  JSON.stringify(events));
-        fs.writeFileSync(tmpSpecPath,    specMarkdown);
+        fs.writeFileSync(tmpEventsPath,     JSON.stringify(events));
+        fs.writeFileSync(tmpFullEventsPath, JSON.stringify(allEvents));
+        fs.writeFileSync(tmpSpecPath,       specMarkdown);
 
         const agentsPath = path.join(process.cwd(), '../atlys-agents');
         const pythonScript = `
@@ -87,10 +89,13 @@ log_progress("init", "Starting ingestion pipeline...")
 with open(${JSON.stringify(tmpEventsPath)}) as f:
     sample_events = json.load(f)
 
+with open(${JSON.stringify(tmpFullEventsPath)}) as f:
+    full_events = json.load(f)
+
 with open(${JSON.stringify(tmpSpecPath)}) as f:
     spec_markdown = f.read()
 
-log_progress("init", f"Loaded {len(sample_events)} sample events")
+log_progress("init", f"Loaded {len(sample_events)} sample events ({len(full_events)} full events for perf test / test harness / production insert)")
 
 from orchestrator import ingest_spec
 
@@ -101,6 +106,7 @@ try:
         spec_name=${JSON.stringify(specName)},
         spec_markdown=spec_markdown,
         sample_events=sample_events,
+        full_events=full_events,
     )
     log_progress("complete", "Pipeline finished")
     print(json.dumps({"type": "result", "data": result}, default=str), flush=True)
@@ -176,7 +182,7 @@ except Exception as e:
         });
 
         python.on('close', (code) => {
-          for (const f of [tmpScriptPath, tmpEventsPath, tmpSpecPath]) {
+          for (const f of [tmpScriptPath, tmpEventsPath, tmpFullEventsPath, tmpSpecPath]) {
             try { fs.unlinkSync(f); } catch { /* ignore */ }
           }
 

@@ -9,7 +9,6 @@ import os
 from opentelemetry import trace
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-from opentelemetry.instrumentation.logging import LoggingInstrumentor
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -51,7 +50,17 @@ def init_hyperdx():
         # Add ClickStack span processor to existing provider
         tracer_provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
 
-        # Instrument Python logging to send logs to ClickStack
+        # Instrument Python logging to send logs to ClickStack. Imported here, not at
+        # module level: opentelemetry-instrumentation-logging is a separate optional
+        # package from the core opentelemetry-instrumentation one, and this whole
+        # module's contract (stated above) is "ClickStack is optional, fails silently
+        # if not configured" — a module-level import would instead hard-crash every
+        # importer of this module (langfuse_wrapper -> orchestrator.pipeline, i.e. the
+        # entire agent pipeline) if this one optional package were ever missing, which
+        # it was: it's not in requirements.txt and wasn't installed in this venv,
+        # meaning `from orchestrator import ingest_spec` raised ModuleNotFoundError on
+        # a clean checkout — caught by actually trying the import, not assumed.
+        from opentelemetry.instrumentation.logging import LoggingInstrumentor
         LoggingInstrumentor().instrument(set_logging_format=True)
 
         # Configure root logger

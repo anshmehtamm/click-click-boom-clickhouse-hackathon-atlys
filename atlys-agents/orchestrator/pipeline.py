@@ -85,7 +85,14 @@ def _flatten_events(events: list[dict], column_mapping: dict[str, str]) -> list[
     the DDL actually declares. Top-level scalar fields also pass through unchanged so
     envelope columns (id, timestamp, user_id, ...) work even if the agent didn't
     enumerate every single one in column_mapping — unmapped/unused keys are silently
-    dropped by ClickHouse's input_format_skip_unknown_fields on insert."""
+    dropped by ClickHouse's input_format_skip_unknown_fields on insert.
+
+    Any raw-value cleanup a join key needs (encoding, casing, format — see
+    INSTRUMENTATION_PROPOSER's join-key-hygiene rule) is NOT done here: the proposer
+    declares it as a `MATERIALIZED` column in columns_ddl using ordinary ClickHouse SQL
+    functions, and ClickHouse computes it itself from the raw ingested column at insert
+    time — identically for perf test, test harness, and the real production load,
+    with no separate Python-side transform step to keep in sync."""
     flat = []
     for e in events:
         row = {k: v for k, v in e.items() if not isinstance(v, dict)}
@@ -251,11 +258,26 @@ def _chronicle(run, executed_proposal: dict, spec_name: str) -> dict:
     return result
 
 
-def ingest_spec(spec_name: str, spec_markdown: str, sample_events: list[dict], pm_question_queries: list[tuple[str, str]] | None = None) -> dict:
+def ingest_spec(
+    spec_name: str, spec_markdown: str, sample_events: list[dict],
+    full_events: list[dict] | None = None, pm_question_queries: list[tuple[str, str]] | None = None,
+) -> dict:
     """Runs one feature spec through the full pipeline. Returns a summary dict with
     the final status, proposal_id, table_name, and the Langfuse trace_url that proves
-    this all came from the pipeline, not a human."""
+    this all came from the pipeline, not a human.
+
+    sample_events is design-time CONTEXT ONLY, given to the proposer so it can see
+    real field shapes/nesting when drafting columns_ddl/column_mapping — small and
+    stratified (e.g. ~30 per event type) on purpose, to keep its prompt cheap. It is
+    NOT what gets tested or loaded. full_events is the actual dataset: perf_tool times
+    candidates against it, test_harness's insert_integrity checks the landed row count
+    against it (this IS the completeness gate — a truncated load fails it directly,
+    no separate check needed), and the real production INSERT at execute uses it.
+    Falls back to sample_events if full_events isn't supplied, so a caller that only
+    has a small sample degrades to the old (sample-only) behavior rather than erroring.
+    """
     meta_client = get_client(database="agent_meta")
+    full_events = full_events if full_events is not None else sample_events
 
     with traced_run(agent="pipeline", spec=spec_name) as run:
         revision = 0
@@ -283,7 +305,12 @@ def ingest_spec(spec_name: str, spec_markdown: str, sample_events: list[dict], p
                 }]
                 continue
             previous_draft = draft
-            flattened_events = _flatten_events(sample_events, draft.get("column_mapping", {}))
+            # full_events, not sample_events: perf test, test harness (whose
+            # insert_integrity check compares landed-row-count to len(sample_rows) —
+            # this IS the completeness gate now, for free) and the real production
+            # INSERT must all see the same real, complete dataset the proposer only
+            # saw a small stratified slice of.
+            flattened_events = _flatten_events(full_events, draft.get("column_mapping", {}))
 
             with run.span("perf_evaluation", revision=revision):
                 candidates = [
@@ -297,7 +324,7 @@ def ingest_spec(spec_name: str, spec_markdown: str, sample_events: list[dict], p
                         candidates=candidates,
                         sample_source=flattened_events,
                         query_patterns=_build_perf_query_patterns(draft["columns_ddl"]),
-                        sample_limit=len(sample_events),
+                        sample_limit=len(full_events),
                         include_baseline=True,
                     )
                 except AllCandidatesFailedError as e:

@@ -57,6 +57,32 @@ def _get_nested(d: dict, dotted_key: str):
     return cur
 
 
+# Matches a bare column ("event_date") or a single function call around one
+# arg-list ("toYYYYMM(event_date)") -- deliberately narrow, not a general SQL
+# parser. A real run had partition_key come back as "" or as prose ("No
+# partition initially; use event_date for filtering") instead of a valid
+# expression -- both are schema-valid strings (partition_key is a required but
+# otherwise unconstrained free-form field) but neither is valid DDL. Rather
+# than trying to fix up prose into SQL, treat anything that doesn't match this
+# shape the same as "no partitioning wanted" -- always safe in ClickHouse,
+# unlike emitting `PARTITION BY <empty-or-garbage>` which is a guaranteed
+# syntax error.
+_VALID_PARTITION_EXPR = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\([^()]*\))?$")
+
+
+def _normalize_partition_key(partition_key) -> str:
+    pk = (partition_key or "").strip()
+    return pk if _VALID_PARTITION_EXPR.match(pk) else ""
+
+
+def _partition_clause(partition_key: str) -> str:
+    """`PARTITION BY <key> ` when there's a real key, else "" -- an empty
+    partition_key must not produce a bare `PARTITION BY ` (ClickHouse then reads
+    the next token, usually the literal word ORDER, as the partition
+    expression and chokes on the BY that follows it)."""
+    return f"PARTITION BY {partition_key} " if partition_key else ""
+
+
 def _column_mapping_to_dict(column_mapping) -> dict[str, str]:
     """agent_runner/schemas.py's strict json_schema reshapes column_mapping from
     {raw_field: column_name} to [{raw_field, column_name}, ...] -- strict mode can't
@@ -435,7 +461,10 @@ def ingest_spec(
                 # nested structure in Python.
                 try:
                     candidates = [
-                        Candidate(label=c["label"], ordering_key=c["ordering_key"], partition_key=c.get("partition_key", "toYYYYMM(timestamp)"))
+                        Candidate(
+                            label=c["label"], ordering_key=c["ordering_key"],
+                            partition_key=_normalize_partition_key(c.get("partition_key", "toYYYYMM(timestamp)")),
+                        )
                         for c in draft["ordering_key_candidates"]
                     ]
                 except (KeyError, TypeError) as e:
@@ -493,7 +522,7 @@ def ingest_spec(
 
             ddl = (
                 f"CREATE TABLE {draft['table_name']} ({draft['columns_ddl']}) "
-                f"ENGINE = MergeTree PARTITION BY {winner.partition_key} ORDER BY {winner.ordering_key}"
+                f"ENGINE = MergeTree {_partition_clause(winner.partition_key)}ORDER BY {winner.ordering_key}"
             )
             # Same failure class as ordering_key_candidates above (valid top-level
             # JSON, malformed nested item — a real run hit test_harness.py's

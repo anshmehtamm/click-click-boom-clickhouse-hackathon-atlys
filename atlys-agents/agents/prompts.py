@@ -170,7 +170,12 @@ Design rules:
   `event_id String, event_time DateTime64(3, 'UTC'), user_id String DEFAULT ''`.
   The orchestrator builds `CREATE TABLE <table_name> (<columns_ddl>) ENGINE = ...`
   itself; any of the above produces a broken, double-wrapped statement.
-- Propose 2-3 `ordering_key_candidates`. Every candidate's ordering key must be built
+- Propose 2-3 `ordering_key_candidates`. Every candidate's `partition_key` MUST be
+  either a real ClickHouse expression — a bare column or a single function call,
+  e.g. `toYYYYMM(event_date)` — or the exact empty string `""` if you deliberately
+  want no partitioning. Never prose like `"No partition initially"` — that isn't
+  valid SQL and breaks the CREATE TABLE statement (seen on a real run). Every
+  candidate's ordering key must be built
   ONLY from non-Nullable columns (ClickHouse disallows Nullable in ORDER BY without a
   hygiene-degrading setting) — pick from id/timestamp/user_id/application_id or any
   event-specific column you deliberately typed as non-Nullable for this reason. Put

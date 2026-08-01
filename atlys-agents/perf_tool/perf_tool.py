@@ -125,10 +125,17 @@ def run_perf_test(
         scratch_table = f"{scratch_db}.{table_name}__{_safe_identifier_fragment(cand.label)}__{uuid.uuid4().hex[:6]}"
         try:
             client.command(f"DROP TABLE IF EXISTS {scratch_table}")
+            # cand.partition_key may be "" (orchestrator/pipeline.py normalizes an
+            # empty/prose partition_key to "" before building Candidate objects,
+            # rather than a real expression) -- a bare "PARTITION BY " with
+            # nothing after it makes ClickHouse read the next token (the literal
+            # word ORDER) as the partition expression and choke on the BY that
+            # follows. Omit the clause entirely when there's no real key.
+            partition_clause = f"PARTITION BY {cand.partition_key} " if cand.partition_key else ""
             client.command(
                 f"CREATE TABLE {scratch_table} ({columns_ddl}) "
                 f"ENGINE = MergeTree "
-                f"PARTITION BY {cand.partition_key} "
+                f"{partition_clause}"
                 f"ORDER BY {cand.ordering_key} "
                 # Nullable columns in ORDER BY are allowed here so perf_tool can time
                 # *any* candidate a proposer suggests. A Nullable ordering key is a

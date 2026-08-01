@@ -215,6 +215,14 @@ export function AgentPanel() {
   const addLog = (stage: string, message: string) =>
     setLogs(prev => [...prev, { id: crypto.randomUUID(), stage, message, ts: Date.now() }]);
 
+  // /api/ingest's stderr handler forwards EVERY line from the Python
+  // subprocess as a log entry, most classified 'trace'/'tool'/'warning' --
+  // that's raw hyperdx/MCP logging passthrough, not agent activity (the real
+  // reasoning/tool-call trace now comes from trace_event/TraceViewer). Only
+  // init/complete/error are worth showing; the rest was pure noise sitting
+  // right under the real widgets.
+  const visibleLogs = logs.filter(l => l.stage === 'init' || l.stage === 'complete' || l.stage === 'error');
+
   // ── folder picker ───────────────────────────────────────────────────────────
 
   const handleFolderChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -497,17 +505,16 @@ export function AgentPanel() {
                 Live trace
               </p>
             </div>
-            {traceEvents.length === 0 && logs.length === 0 ? (
+            {traceEvents.length === 0 && visibleLogs.length === 0 ? (
               <p className="py-8 text-center text-xs" style={{ color: '#c0b8b0' }}>Initializing…</p>
             ) : (
               <>
                 {traceEvents.length > 0 && <TraceViewer events={traceEvents} />}
-                {/* Plain init/error/complete log lines aren't trace events
-                    (they come from the subprocess wrapper itself, not
-                    run.log()) — keep them visible below so nothing's lost. */}
-                {logs.length > 0 && (
+                {/* init/complete/error only -- these come from the subprocess
+                    wrapper itself, not run.log(), so they're not trace_events. */}
+                {visibleLogs.length > 0 && (
                   <div className="mt-3 rounded-xl border p-2.5" style={{ borderColor: '#e5dfd6', backgroundColor: '#faf8f5' }}>
-                    {logs.map(l => <LogRow key={l.id} entry={l} />)}
+                    {visibleLogs.map(l => <LogRow key={l.id} entry={l} />)}
                   </div>
                 )}
                 <div ref={traceEndRef} />
@@ -542,14 +549,14 @@ export function AgentPanel() {
             {traceEvents.length > 0 && <TraceViewer events={traceEvents} />}
 
             {/* Plain init/error/complete log lines */}
-            {logs.length > 0 && (
+            {visibleLogs.length > 0 && (
               <details className="rounded-xl border overflow-hidden" style={{ borderColor: '#e5dfd6' }}>
                 <summary className="px-4 py-2.5 text-xs font-medium cursor-pointer hover:bg-stone-50"
                   style={{ color: '#4a4540' }}>
-                  Run log ({logs.length} entries)
+                  Run log ({visibleLogs.length} entries)
                 </summary>
                 <div className="px-3 py-2 max-h-60 overflow-y-auto" style={{ backgroundColor: '#faf8f5' }}>
-                  {logs.map(l => <LogRow key={l.id} entry={l} />)}
+                  {visibleLogs.map(l => <LogRow key={l.id} entry={l} />)}
                 </div>
               </details>
             )}

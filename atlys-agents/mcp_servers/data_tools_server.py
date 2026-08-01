@@ -15,9 +15,11 @@ Two things fix this:
    scratch file and returns a small preview + pointer, with grep_scratch/read_scratch
    tools to inspect the rest without ever pulling it all into context at once.
 """
+import ast
 import json
 import pathlib
 import re
+import subprocess
 import sys
 import uuid
 
@@ -32,6 +34,7 @@ SCRATCH_DIR.mkdir(exist_ok=True)
 
 PREVIEW_ROW_LIMIT = 20
 PREVIEW_CHAR_LIMIT = 3000
+MAX_ROWS_HARD_CAP = 10_000  # a query forgetting its own LIMIT must still never pull all 1M+ rows
 
 server = FastMCP(
     name="atlys_data", instructions="Read-only, size-capped tools for real Atlys ClickHouse data.",
@@ -66,14 +69,20 @@ def describe_table(table_name: str, database: str = "atlys") -> list[dict]:
 
 @server.tool()
 def run_query(query: str, database: str = "atlys") -> dict:
-    """Runs a READ-ONLY query (writes rejected server-side). If the result is small
-    it's returned inline. If it's large, the FULL result is saved to a scratch file
-    and you get a preview + the file path — use grep_scratch/read_scratch to inspect
-    the rest instead of asking for it all again. Prefer aggregate queries
-    (GROUP BY/count/uniq) over row dumps; add your own LIMIT for exploratory SELECTs."""
+    """Runs a READ-ONLY query (writes rejected server-side). Results up to
+    ~10,000 rows are allowed through — small ones come back inline, large ones go
+    to a scratch file (see below) — but the query is always capped at
+    MAX_ROWS_HARD_CAP regardless of whether you added your own LIMIT, so a
+    forgotten LIMIT can't pull millions of rows into memory. Prefer aggregate
+    queries (GROUP BY/count/uniq) over row dumps where the question allows it."""
     client = get_client(database=database)
-    result = client.query(query, settings={"readonly": 1})
+    # Wrapping as an outer-LIMIT subquery caps the result regardless of whether the
+    # query has its own LIMIT (a redundant outer LIMIT >= an existing inner one is
+    # harmless) — safer than trying to detect/parse an existing LIMIT clause.
+    capped_query = f"SELECT * FROM ({query}) LIMIT {MAX_ROWS_HARD_CAP}"
+    result = client.query(capped_query, settings={"readonly": 1})
     rows = [dict(zip(result.column_names, row)) for row in result.result_rows]
+    hit_cap = len(rows) == MAX_ROWS_HARD_CAP
     inline_json = json.dumps({"columns": result.column_names, "rows": rows}, default=str)
 
     if len(rows) <= PREVIEW_ROW_LIMIT and len(inline_json) <= PREVIEW_CHAR_LIMIT:
@@ -89,14 +98,20 @@ def run_query(query: str, database: str = "atlys") -> dict:
         for row in rows:
             f.write(json.dumps(row, default=str) + "\n")
     total_bytes = scratch_file.stat().st_size
+    hint = (
+        f"{len(rows)} total rows saved to scratch_file, one JSON row per line ({total_bytes} bytes). "
+        f"Use grep_scratch(scratch_file, pattern) to search it, or read_scratch(scratch_file, start_line, n_lines) to page through it — don't ask for this query again."
+    )
+    if hit_cap:
+        hint += f" NOTE: hit the {MAX_ROWS_HARD_CAP}-row hard cap — there may be more rows than this; narrow with WHERE/a smaller LIMIT if you need a specific slice rather than everything."
     return {
         "columns": result.column_names,
         "preview_rows": rows[:PREVIEW_ROW_LIMIT],
         "row_count": len(rows),
+        "hit_row_cap": hit_cap,
         "truncated": True,
         "scratch_file": str(scratch_file),
-        "hint": f"{len(rows)} total rows saved to scratch_file, one JSON row per line ({total_bytes} bytes). "
-        f"Use grep_scratch(scratch_file, pattern) to search it, or read_scratch(scratch_file, start_line, n_lines) to page through it — don't ask for this query again.",
+        "hint": hint,
     }
 
 
@@ -127,6 +142,62 @@ def read_scratch(scratch_file: str, start_line: int = 0, n_lines: int = 50) -> l
         raise ValueError("scratch_file must be a path returned by run_query")
     lines = path.read_text().splitlines()
     return lines[start_line : start_line + n_lines]
+
+
+EXEC_TIMEOUT_S = 15
+EXEC_OUTPUT_CHAR_CAP = 4000
+ALLOWED_IMPORTS = {"pandas"}  # nothing else — no os/subprocess/socket/etc.
+
+
+def _check_imports_allowed(code: str) -> str | None:
+    """Static allowlist check via ast — this is not the sandboxing (there isn't
+    real sandboxing here, see execute_python's docstring), it's a guardrail against
+    the LLM reaching for stdlib/network/filesystem-escape modules by habit. Returns
+    an error string if a disallowed import is found, else None."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return f"SyntaxError: {e}"
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                if top not in ALLOWED_IMPORTS:
+                    return f"Import not allowed: '{alias.name}'. Only `pandas` may be imported in execute_python."
+        elif isinstance(node, ast.ImportFrom):
+            top = (node.module or "").split(".")[0]
+            if top not in ALLOWED_IMPORTS:
+                return f"Import not allowed: 'from {node.module} import ...'. Only `pandas` may be imported in execute_python."
+    return None
+
+
+@server.tool()
+def execute_python(code: str) -> dict:
+    """Runs Python for dataframe analysis SQL can't express cleanly (correlation,
+    pivoting, custom stats over a scratch file from run_query) — pandas ONLY, no
+    other imports permitted (checked before execution; you'll get an error, not a
+    silent failure, if you try). NOT strongly sandboxed — plain subprocess, same OS
+    privileges as this tool server, no container isolation, no network,
+    15s timeout. Working directory is the scratch dir, so
+    `pd.read_json("some_query_file.ndjson", lines=True)` works with just the
+    filename. Print everything you want to see; only stdout/stderr are returned
+    (truncated if long)."""
+    import_error = _check_imports_allowed(code)
+    if import_error:
+        return {"stdout": "", "stderr": import_error, "exit_code": -1, "truncated": False}
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=SCRATCH_DIR, capture_output=True, text=True, timeout=EXEC_TIMEOUT_S,
+        )
+        return {
+            "stdout": result.stdout[:EXEC_OUTPUT_CHAR_CAP],
+            "stderr": result.stderr[:EXEC_OUTPUT_CHAR_CAP],
+            "exit_code": result.returncode,
+            "truncated": len(result.stdout) > EXEC_OUTPUT_CHAR_CAP or len(result.stderr) > EXEC_OUTPUT_CHAR_CAP,
+        }
+    except subprocess.TimeoutExpired:
+        return {"stdout": "", "stderr": f"Timed out after {EXEC_TIMEOUT_S}s", "exit_code": -1, "truncated": False}
 
 
 if __name__ == "__main__":

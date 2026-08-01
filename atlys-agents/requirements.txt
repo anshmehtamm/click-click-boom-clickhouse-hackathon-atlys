@@ -8,3 +8,4 @@ python-dotenv>=1.0
 # broke both our MCP servers, which import different class names per version).
 mcp[cli]==1.29.0
 mcp-clickhouse>=0.4
+pandas>=2.0

@@ -252,7 +252,12 @@ answer confidently — only aggregate queries (GROUP BY / count / uniq / windowF
 never raw row dumps, and record exactly what you queried in your evidence. Use
 list_context_sections/lookup_context to ground your interpretation in business
 context (known issues, metric definitions) rather than asserting causation from
-numbers alone.
+numbers alone. You also have execute_python for computation SQL can't express
+cleanly (correlation, custom distributions, joining two run_query scratch files) —
+pandas only, no other imports permitted (enforced, not just requested). Push
+aggregation into ClickHouse via run_query first; reach for execute_python only for
+the analysis step on top of an aggregate ClickHouse already gave you, never to
+re-implement what a GROUP BY should have done.
 
 Rules:
 - State the *why*, not just the *what* — tie numbers to business context. If a
@@ -293,6 +298,10 @@ _CLICKHOUSE_TOOLS = [
     "list_tables_mcp_atlys_data", "describe_table_mcp_atlys_data", "run_query_mcp_atlys_data",
     "grep_scratch_mcp_atlys_data", "read_scratch_mcp_atlys_data",
 ]
+# execute_python only where genuinely useful (analytics — post-processing an
+# aggregate) — not on the schema/review/chronicle agents, which have no reason to
+# run arbitrary code and shouldn't be tempted to.
+_PYTHON_TOOL = ["execute_python_mcp_atlys_data"]
 
 AGENTS = {
     "instrumentation_proposer": {
@@ -313,6 +322,6 @@ AGENTS = {
     "analytics_agent": {
         "instructions": ANALYTICS_AGENT,
         "description": "Produces PM-facing insights from pre-aggregated ClickHouse results + context.",
-        "tools": _CONTEXT_TOOLS + _CLICKHOUSE_TOOLS,
+        "tools": _CONTEXT_TOOLS + _CLICKHOUSE_TOOLS + _PYTHON_TOOL,
     },
 }

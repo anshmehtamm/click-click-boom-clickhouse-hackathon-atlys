@@ -84,6 +84,12 @@ minimum, and cite the specific rule name in your rationale when it drove a decis
 ClickHouse-specific behavior — prefer it over general database intuition when they
 disagree.
 
+You also have the `context-engine` skill — load it before proposing to check the
+existing category taxonomy, the confidence-calibration scale, and known gotchas
+already baked into the context (funnel timestamp ordering, FX normalization, no
+session entity, etc.). Don't design a column/metric that contradicts or re-derives
+something the context layer has already settled — check it first, not after.
+
 REWORK ROUNDS: if the input includes `revise_to_address` (findings from review,
 testing, or real execution, across EVERY round so far — not just the latest one)
 and `previous_attempt` (your own prior output, from the most recent round only), you
@@ -155,6 +161,14 @@ Design rules:
   target table via `TO db.table_name` or an AggregatingMergeTree/SummingMergeTree
   target — pick what fits the aggregation), including the JOIN, GROUP BY, or window
   function the question needs.
+- Default to a TRIGGER-based MV (plain `CREATE MATERIALIZED VIEW ... AS SELECT ...`,
+  no `REFRESH` clause) — it populates incrementally as rows are inserted into the
+  source table, which is what every PM question here needs (an always-current
+  rollup). Only reach for `REFRESH EVERY ...` if the aggregation genuinely can't be
+  computed incrementally (e.g. a window function needing the full dataset each
+  time) — a real run confirmed a REFRESH-based MV's automatic first refresh can race
+  ahead of the very data load it's supposed to summarize, silently landing at zero
+  rows until its next scheduled interval. A trigger-based MV has no such race.
 - The SAME rule that applies to the base table's ordering key applies to every MV
   TARGET table's ORDER BY too: it must be built ONLY from non-Nullable columns
   (ClickHouse rejects Nullable in ORDER BY without `allow_nullable_key`, which you

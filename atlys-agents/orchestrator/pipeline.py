@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import time
 import uuid
 from collections import Counter
 
@@ -595,6 +596,34 @@ def ingest_spec(
                             final_proposal["table_name"], insert_block=body, fmt="JSONEachRow",
                             settings={"input_format_skip_unknown_fields": 1},
                         )
+
+                    # Refreshable MVs (`REFRESH EVERY ...`) don't populate from the
+                    # INSERT above at all -- unlike a trigger-based MV, they only
+                    # recompute on their own schedule, and CREATE happens before the
+                    # INSERT (has to, for a trigger-based MV to catch it), so a
+                    # refreshable MV's automatic first refresh can race ahead of the
+                    # data landing -- it then "succeeds" with zero rows and won't
+                    # try again for up to the full REFRESH interval. Found via a real
+                    # run: forex's trigger-based MV populated correctly (1807 rows),
+                    # but abandoned_checkout_recovery's REFRESH EVERY 1 HOUR MV sat at
+                    # 0 rows despite reporting a successful refresh. Force a fresh
+                    # refresh here, after data is confirmed landed, and wait for it
+                    # to actually complete rather than trusting the schedule.
+                    for mv in final_proposal.get("materialized_views", []):
+                        mv_name = mv.get("name")
+                        if mv_name and "REFRESH" in mv["ddl"].upper():
+                            executing = (mv_name, f"SYSTEM REFRESH VIEW atlys.{mv_name}")
+                            data_client.command(f"SYSTEM REFRESH VIEW atlys.{mv_name}")
+                            for _ in range(15):  # ~15s bounded wait, not indefinite
+                                status_rows = data_client.query(
+                                    "SELECT status FROM system.view_refreshes WHERE view = {name:String}",
+                                    parameters={"name": mv_name},
+                                ).result_rows
+                                if status_rows and status_rows[0][0] != "Running":
+                                    break
+                                time.sleep(1)
+                            run.log(step="refreshable_mv_synced", input=mv_name, output={"status": status_rows[0][0] if status_rows else "unknown"})
+
                     run.log(step="executed", input=None, output={"table": f"atlys.{final_proposal['table_name']}"})
             except Exception as e:
                 failed_label, failed_stmt = executing or ("unknown", "")

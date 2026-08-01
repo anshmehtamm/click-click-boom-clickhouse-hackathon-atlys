@@ -184,14 +184,16 @@ function agentBadge(step) {
 
 // LibreChat's function_call.arguments is always empty (confirmed via direct API
 // testing), so a "skill" tool call never tells us WHICH skill loaded from its own
-// payload. But this deployment only has one real skill (LibreChat/skill/
-// clickhouse-best-practices/SKILL.md), statically attached per agents/prompts.py's
-// AGENTS dict to exactly these two agents (skills_enabled: True) -- so a static
-// lookup by agent is accurate, not a guess. Update this map if a second skill or a
-// different attachment ever gets added.
+// payload -- only a static lookup by agent, from agents/prompts.py's AGENTS dict,
+// is possible. Proposer/Reviewer have exactly one skill each (unambiguous).
+// Chronicler has TWO (context-engine, context-update) since skills_enabled is an
+// all-or-nothing toggle -- LibreChat has no per-skill selection -- so which ONE a
+// given chronicler "skill" call loaded isn't determinable from here; shown as
+// "either" rather than falsely picking one.
 const SKILL_BY_AGENT = {
-  "Instrumentation Proposer": "clickhouse-best-practices",
+  "Instrumentation Proposer": "clickhouse-best-practices or context-engine",
   "Context Reviewer": "clickhouse-best-practices",
+  "Context Chronicler": "context-engine or context-update",
 };
 
 // Real tool families in this pipeline (see agents/prompts.py TOOLS_NOTE /
@@ -316,9 +318,10 @@ function renderRow(ev, idx) {
   const tool = toolCallInfo(ev);
   if (tool) {
     const skillLine = tool.skillName
-      ? `\n\n<span class="k">skill loaded</span>\n${tool.skillName}  (static lookup by agent — this deployment has ` +
-        `exactly one skill, LibreChat/skill/clickhouse-best-practices, attached only to Instrumentation Proposer + ` +
-        `Context Reviewer; the tool call itself carries no name since arguments are empty)`
+      ? `\n\n<span class="k">skill loaded</span>\n${tool.skillName}  (static lookup by agent, from ` +
+        `agents/prompts.py's AGENTS dict — the tool call itself carries no name since arguments are always ` +
+        `empty. Where an agent has more than one skill attached, "or" means which specific one loaded isn't ` +
+        `determinable from this API, not that both loaded.)`
       : "";
     parts.push(
       `<span class="k">tool</span>\n${tool.name}  (type: ${tool.label}, call #${tool.index} in this agent turn)${skillLine}\n\n` +

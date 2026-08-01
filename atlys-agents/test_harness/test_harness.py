@@ -280,11 +280,26 @@ def run_new_table_tests(
                         passed=False, actual=f"ERROR: {e}", duration_ms=round(elapsed, 2),
                     ))
         finally:
+            # Best-effort cleanup: DROP TABLE and DROP VIEW are not interchangeable
+            # no-ops in ClickHouse the way IF EXISTS might suggest -- IF EXISTS only
+            # suppresses "doesn't exist", not "exists but is the wrong kind" (e.g.
+            # `DROP VIEW IF EXISTS <a real table>` raises INCORRECT_QUERY, it
+            # doesn't silently skip). We don't reliably know which kind each scratch
+            # object is (a 2-statement MV pattern creates one of each), so try both,
+            # but a cleanup failure must never crash a run whose real results are
+            # already computed -- this is our own bug, not something the LLM's
+            # proposal did wrong, and shouldn't cost anyone a revision or a crash.
             for t in mv_scratch_tables:
-                client.command(f"DROP TABLE IF EXISTS {t}")
-                client.command(f"DROP VIEW IF EXISTS {t}")
+                for drop_stmt in (f"DROP TABLE IF EXISTS {t}", f"DROP VIEW IF EXISTS {t}"):
+                    try:
+                        client.command(drop_stmt)
+                    except Exception:
+                        pass
     finally:
-        client.command(f"DROP TABLE IF EXISTS {scratch_table}")
+        try:
+            client.command(f"DROP TABLE IF EXISTS {scratch_table}")
+        except Exception:
+            pass
 
     return TestSuiteResult(passed=all(r.passed for r in results), results=results)
 

@@ -164,10 +164,27 @@ def _log_agent_call(run, step: str, input_data, result, **metadata):
         )
         # Log each tool call separately for detailed tracing
         for i, tc in enumerate(result.tool_calls):
+            # Extract execution_time_ms from tool output if present (for ClickHouse queries)
+            tool_metadata = {}
+            tool_output = tc.get("output")
+            if tool_output:
+                try:
+                    # Tool output might be a JSON string or already parsed dict
+                    if isinstance(tool_output, str):
+                        output_dict = json.loads(tool_output)
+                    else:
+                        output_dict = tool_output
+
+                    if isinstance(output_dict, dict) and "execution_time_ms" in output_dict:
+                        tool_metadata["execution_time_ms"] = output_dict["execution_time_ms"]
+                except (json.JSONDecodeError, TypeError):
+                    pass  # Not JSON or not a dict, skip timing extraction
+
             run.log(
                 step=f"{step}_tool[{i}]_{tc.get('name')}",
                 input=tc.get("arguments"),
-                output=tc.get("output")
+                output=tool_output,
+                **tool_metadata
             )
 
 

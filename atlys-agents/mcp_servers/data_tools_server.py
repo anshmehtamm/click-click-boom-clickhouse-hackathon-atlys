@@ -21,6 +21,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import time
 import uuid
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
@@ -43,28 +44,38 @@ server = FastMCP(
 
 
 @server.tool()
-def list_tables(database: str = "atlys") -> list[dict]:
+def list_tables(database: str = "atlys") -> dict:
     """Lists tables in a database — name, engine, row count only. For column
     details on a SPECIFIC table you already know you need, use describe_table."""
     client = get_client(database=database)
+    start_time = time.perf_counter()
     rows = client.query(
         "SELECT name, engine, total_rows FROM system.tables WHERE database = {db:String} ORDER BY name",
         parameters={"db": database},
     ).result_rows
-    return [{"table": n, "engine": e, "row_count": r} for n, e, r in rows]
+    execution_time_ms = (time.perf_counter() - start_time) * 1000
+    return {
+        "tables": [{"table": n, "engine": e, "row_count": r} for n, e, r in rows],
+        "execution_time_ms": round(execution_time_ms, 2)
+    }
 
 
 @server.tool()
-def describe_table(table_name: str, database: str = "atlys") -> list[dict]:
+def describe_table(table_name: str, database: str = "atlys") -> dict:
     """Column name + type for ONE table. Call this per-table, not in bulk —
     there's no "describe everything" tool on purpose; if you need several tables,
     call this once per table you actually need."""
     client = get_client(database=database)
+    start_time = time.perf_counter()
     rows = client.query(
         "SELECT name, type FROM system.columns WHERE database = {db:String} AND table = {t:String} ORDER BY position",
         parameters={"db": database, "t": table_name},
     ).result_rows
-    return [{"column": n, "type": t} for n, t in rows]
+    execution_time_ms = (time.perf_counter() - start_time) * 1000
+    return {
+        "columns": [{"column": n, "type": t} for n, t in rows],
+        "execution_time_ms": round(execution_time_ms, 2)
+    }
 
 
 @server.tool()
@@ -80,13 +91,21 @@ def run_query(query: str, database: str = "atlys") -> dict:
     # query has its own LIMIT (a redundant outer LIMIT >= an existing inner one is
     # harmless) — safer than trying to detect/parse an existing LIMIT clause.
     capped_query = f"SELECT * FROM ({query}) LIMIT {MAX_ROWS_HARD_CAP}"
+    start_time = time.perf_counter()
     result = client.query(capped_query, settings={"readonly": 1})
+    execution_time_ms = (time.perf_counter() - start_time) * 1000
     rows = [dict(zip(result.column_names, row)) for row in result.result_rows]
     hit_cap = len(rows) == MAX_ROWS_HARD_CAP
     inline_json = json.dumps({"columns": result.column_names, "rows": rows}, default=str)
 
     if len(rows) <= PREVIEW_ROW_LIMIT and len(inline_json) <= PREVIEW_CHAR_LIMIT:
-        return {"columns": result.column_names, "rows": rows, "row_count": len(rows), "truncated": False}
+        return {
+            "columns": result.column_names,
+            "rows": rows,
+            "row_count": len(rows),
+            "truncated": False,
+            "execution_time_ms": round(execution_time_ms, 2)
+        }
 
     # NDJSON — one row per line — is essential here, not cosmetic: grep_scratch and
     # read_scratch operate line-by-line, so a single minified JSON blob (one giant
@@ -112,6 +131,7 @@ def run_query(query: str, database: str = "atlys") -> dict:
         "truncated": True,
         "scratch_file": str(scratch_file),
         "hint": hint,
+        "execution_time_ms": round(execution_time_ms, 2)
     }
 
 

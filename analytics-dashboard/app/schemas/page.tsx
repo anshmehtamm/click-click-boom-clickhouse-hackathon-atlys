@@ -1,4 +1,3 @@
-import { Sidebar } from '@/components/sidebar';
 import { Database, ExternalLink } from 'lucide-react';
 
 async function getSchemas() {
@@ -17,10 +16,8 @@ export default async function SchemasPage() {
   const schemas = await getSchemas();
 
   return (
-    <div className="flex h-screen">
-      <Sidebar />
-      <main className="flex-1 overflow-y-auto p-8">
-        <div className="max-w-7xl mx-auto space-y-6">
+    <div className="p-8">
+      <div className="max-w-5xl mx-auto space-y-6">
           <div className="space-y-2">
             <h1 className="text-3xl font-bold text-white">Schema Proposals</h1>
             <p className="text-zinc-400">
@@ -95,7 +92,6 @@ export default async function SchemasPage() {
             </div>
           )}
         </div>
-      </main>
-    </div>
+      </div>
   );
 }

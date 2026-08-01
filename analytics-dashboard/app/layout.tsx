@@ -3,6 +3,8 @@ import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { LeftNav } from "@/components/left-nav";
 import { AgentPanel } from "@/components/agent-panel";
+import { PanelProvider } from "@/lib/panel-context";
+import { PanelShell } from "@/components/panel-shell";
 
 const geistSans = Geist({ variable: "--font-geist-sans", subsets: ["latin"] });
 const geistMono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin"] });
@@ -16,13 +18,11 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
   return (
     <html lang="en" className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}>
       <body className="h-full" style={{ backgroundColor: '#f5f1eb', color: '#1c1814' }}>
-        <div className="flex h-screen overflow-hidden">
-          <LeftNav />
-          <main className="flex-1 overflow-y-auto min-w-0">
+        <PanelProvider>
+          <PanelShell nav={<LeftNav />} panel={<AgentPanel />}>
             {children}
-          </main>
-          <AgentPanel />
-        </div>
+          </PanelShell>
+        </PanelProvider>
       </body>
     </html>
   );

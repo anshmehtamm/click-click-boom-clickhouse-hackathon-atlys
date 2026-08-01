@@ -135,26 +135,37 @@ def _build_perf_query_patterns(columns_ddl: str) -> list[str]:
     return patterns
 
 
+def _log_agent_call(run, step: str, input_summary, result, **metadata):
+    """Logs the call as a span with its own nested child span per tool call the agent
+    actually made — so a judge opening the trace sees the real reasoning chain (which
+    tools, what args, in what order), not one opaque call."""
+    with run.span(step, **metadata) as span:
+        for i, tc in enumerate(result.tool_calls):
+            run.log(step=f"tool_call[{i}]: {tc.get('name')}", input=tc.get("arguments"), output=tc.get("output"))
+        span_summary = {"final_output": result.output_text[:1500], "n_tool_calls": len(result.tool_calls)}
+    run.log(step=f"{step}_summary", input=input_summary, output=span_summary)
+
+
 def _propose(run, spec_name: str, spec_markdown: str, sample_events: list[dict], prior_findings: list[dict] | None) -> dict:
     payload = {"spec_markdown": spec_markdown, "sample_events": sample_events}
     if prior_findings:
         payload["revise_to_address"] = prior_findings
     r = call_agent(os.environ["LIBRECHAT_AGENT_INSTRUMENTATION_PROPOSER"], json.dumps(payload))
-    run.log(step="propose", input=payload, output=r.output_text[:2000])
+    _log_agent_call(run, "propose", {"spec_name": spec_name, "n_sample_events": len(sample_events)}, r)
     return _extract_json(r.output_text)
 
 
-def _review(run, proposal: dict, context: list[dict]) -> dict:
-    payload = {"proposal": proposal, "current_context": context}
+def _review(run, proposal: dict) -> dict:
+    payload = {"proposal": proposal}
     r = call_agent(os.environ["LIBRECHAT_AGENT_CONTEXT_REVIEWER"], json.dumps(payload))
-    run.log(step="review", input={"proposal": proposal}, output=r.output_text[:2000])
+    _log_agent_call(run, "review", {"table_name": proposal.get("table_name")}, r)
     return _extract_json(r.output_text)
 
 
-def _chronicle(run, executed_proposal: dict, spec_name: str, context: list[dict]) -> dict:
-    payload = {"executed_proposal": executed_proposal, "spec_name": spec_name, "current_context": context}
+def _chronicle(run, executed_proposal: dict, spec_name: str) -> dict:
+    payload = {"executed_proposal": executed_proposal, "spec_name": spec_name}
     r = call_agent(os.environ["LIBRECHAT_AGENT_CONTEXT_CHRONICLER"], json.dumps(payload))
-    run.log(step="chronicle", input={"table_name": executed_proposal.get("table_name")}, output=r.output_text[:2000])
+    _log_agent_call(run, "chronicle", {"table_name": executed_proposal.get("table_name")}, r)
     return _extract_json(r.output_text)
 
 
@@ -220,8 +231,7 @@ def ingest_spec(spec_name: str, spec_markdown: str, sample_events: list[dict], p
                     confidence=proposal["confidence"], rationale=proposal["rationale"],
                 )
 
-            context = get_current_context()
-            review = _review(run, proposal, context)
+            review = _review(run, proposal)
             _write_review(meta_client, proposal_id, revision, review, review.get("context_sections_used", []), run.url)
 
             final_proposal, final_review, final_flattened_events = proposal, review, flattened_events
@@ -271,8 +281,7 @@ def ingest_spec(spec_name: str, spec_markdown: str, sample_events: list[dict], p
             run.log(step="regression_result", input=None, output={"passed": regression.passed, "n_tests": len(regression.results)})
 
         with run.span("chronicle"):
-            context = get_current_context()
-            chronicle = _chronicle(run, final_proposal, spec_name, context)
+            chronicle = _chronicle(run, final_proposal, spec_name)
             _write_context_sections(meta_client, chronicle["sections"], run.url)
 
         return {

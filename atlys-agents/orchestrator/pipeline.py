@@ -239,6 +239,14 @@ def _log_agent_call(run, step: str, input_data, result, reasoning: str | None = 
             )
 
 
+def _record_findings(history: list[dict], new_findings: list[dict], round_num: int) -> list[dict]:
+    """Tags new findings with the round they surfaced in and appends to the running
+    history (in place), returning it for convenience at the call site."""
+    for f in new_findings:
+        history.append({**f, "found_in_round": round_num})
+    return history
+
+
 def _propose(run, spec_name: str, spec_markdown: str, sample_events: list[dict], prior_findings: list[dict] | None, previous_draft: dict | None) -> dict:
     payload = {"spec_markdown": spec_markdown, "sample_events": sample_events}
     if prior_findings:
@@ -303,6 +311,15 @@ def ingest_spec(
         proposal_id = None
         final_proposal = None
         final_review = None
+        # Cumulative across ALL rounds, not just the latest failure. Each round used
+        # to overwrite prior_findings with only the newest failure, so the proposer
+        # never saw the pattern across rounds — e.g. round 1 flags MV-A's Nullable
+        # ORDER BY, proposer fixes MV-A but introduces the identical bug in a NEW
+        # MV-B in round 2, and round 2's findings (MV-B only) give no signal that
+        # this is a recurring category, not a one-off. Tagged with the round found
+        # so the proposer can tell "this was already addressed" (a fix attempt
+        # happened after it) from "this is still live" (no later attempt touched it).
+        finding_history: list[dict] = []
 
         while True:
             try:
@@ -315,11 +332,11 @@ def ingest_spec(
                 if revision >= MAX_REVISIONS:
                     raise
                 revision += 1
-                prior_findings = [{
+                prior_findings = _record_findings(finding_history, [{
                     "severity": "block", "category": "invalid_json",
                     "description": f"Your last two attempts didn't produce valid JSON: {e.parse_error}",
                     "suggested_fix": "Output ONLY a single JSON object matching the schema — no markdown fences, no prose, no truncation.",
-                }]
+                }], revision)
                 continue
             previous_draft = draft
             # full_events, not sample_events: perf test, test harness (whose
@@ -353,11 +370,11 @@ def ingest_spec(
                     if revision >= MAX_REVISIONS:
                         raise
                     revision += 1
-                    prior_findings = [{
+                    prior_findings = _record_findings(finding_history, [{
                         "severity": "block", "category": "invalid_ddl",
                         "description": f"columns_ddl failed to create in ClickHouse: {next(iter(e.errors.values()))}",
                         "suggested_fix": "Fix the ClickHouse type syntax (e.g. LowCardinality must wrap Nullable, not the reverse: LowCardinality(Nullable(String))) and resubmit.",
-                    }]
+                    }], revision)
                     continue
                 winner = next(c for c in candidates if c.label == perf_report.winner) if perf_report.winner != "baseline_legacy" else candidates[0]
                 run.log(step="perf_winner", input=[c.label for c in candidates], output={"winner": winner.label, "speedup": perf_report.speedup_vs_baseline})
@@ -374,6 +391,43 @@ def ingest_spec(
                 "confidence": draft.get("confidence", 0.5),
                 "rationale": draft.get("rationale", "") + f" | ordering key chosen by perf_tool: {perf_report.speedup_vs_baseline}x vs legacy baseline.",
             }
+
+            # DDL syntax gate — runs BEFORE review, not after. Reviewer LLM calls and
+            # the full data-insert test cycle are both expensive (money + a shared
+            # revision from MAX_REVISIONS); a broken MV CREATE statement is a cheap,
+            # mechanical failure ClickHouse itself can tell us about in milliseconds.
+            # Catching it here means a syntax error costs one fast scratch-DDL round
+            # trip instead of a full review round PLUS the same test_harness failure
+            # it would have hit anyway later. Base table DDL isn't re-checked here —
+            # perf_evaluation above already validated it via the candidate scratch
+            # tables it creates for timing.
+            if proposal["materialized_views"]:
+                with run.span("ddl_syntax_check", revision=revision):
+                    syntax_suite = run_new_table_tests(
+                        table_name=proposal["table_name"], columns_ddl=proposal["columns_ddl"],
+                        ordering_key=proposal["ordering_key"], partition_key=proposal["partition_key"],
+                        sample_rows=[], smoke_queries=[],
+                        materialized_views=proposal["materialized_views"], ddl_only=True,
+                    )
+                    run.log(
+                        step="ddl_syntax_result", input=None,
+                        output={"passed": syntax_suite.passed, "failures": [r.__dict__ for r in syntax_suite.results if not r.passed]},
+                    )
+                    if not syntax_suite.passed:
+                        if revision >= MAX_REVISIONS:
+                            # Let it fall through to the real review/test cycle rather than
+                            # rejecting outright — the shared cap means we're out of cheap
+                            # shots either way, and the normal test_harness_failed path below
+                            # gives a more complete final error report than stopping here would.
+                            pass
+                        else:
+                            revision += 1
+                            prior_findings = _record_findings(finding_history, [{
+                                "severity": "block", "category": "invalid_ddl",
+                                "description": f"MV DDL failed to create in scratch (syntax/type check, before review): {[r.description + ': ' + r.actual for r in syntax_suite.results if not r.passed]}",
+                                "suggested_fix": "Fix the failing MV's CREATE statement (check ORDER BY column nullability, type nesting, and referenced column names) and resubmit.",
+                            }], revision)
+                            continue
 
             mv_json = [json.dumps(mv) for mv in proposal["materialized_views"]]
             proposal_id = _write_proposal(
@@ -409,7 +463,7 @@ def ingest_spec(
             at_cap = revision >= MAX_REVISIONS
             if review["verdict"] != "approve" and not at_cap:
                 revision += 1
-                prior_findings = review["findings"]
+                prior_findings = _record_findings(finding_history, review["findings"], revision)
                 _update_proposal_status(meta_client, proposal_id, status="needs_rework", revision=revision)
                 continue
             if review["verdict"] != "approve":
@@ -446,11 +500,11 @@ def ingest_spec(
                         _update_proposal_status(meta_client, proposal_id, status="needs_rework")
                         return {"status": "needs_rework", "reason": "test_harness_failed", "proposal_id": proposal_id, "trace_url": run.url, "test_results": [r.__dict__ for r in suite.results]}
                     revision += 1
-                    prior_findings = [{
+                    prior_findings = _record_findings(finding_history, [{
                         "severity": "block", "category": "test_harness_failure",
                         "description": f"Correctness test(s) failed: {[r.description + ': ' + r.actual for r in suite.results if not r.passed]}",
                         "suggested_fix": "Fix the failing query/MV logic (check column names, types, and join keys) and resubmit.",
-                    }]
+                    }], revision)
                     _update_proposal_status(meta_client, proposal_id, status="needs_rework", revision=revision)
                     continue
 
@@ -504,11 +558,11 @@ def ingest_spec(
                     _update_proposal_status(meta_client, proposal_id, status="rejected")
                     return {"status": "rejected", "reason": "execute_failed", "proposal_id": proposal_id, "trace_url": run.url, "error": str(e)}
                 revision += 1
-                prior_findings = [{
+                prior_findings = _record_findings(finding_history, [{
                     "severity": "block", "category": "invalid_ddl",
                     "description": f"Real execution against ClickHouse failed on '{failed_label}'. Failing statement: {failed_stmt}\nError: {e}",
                     "suggested_fix": "Fix ONLY the failing statement identified above (e.g. if it's an ORDER BY referencing a Nullable column, fix that column's typing or the ordering key) — keep everything else from previous_attempt unchanged unless it's also actually wrong.",
-                }]
+                }], revision)
                 _update_proposal_status(meta_client, proposal_id, status="needs_rework", revision=revision)
                 continue
 

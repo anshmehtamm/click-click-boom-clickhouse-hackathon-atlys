@@ -66,16 +66,26 @@ minimum, and cite the specific rule name in your rationale when it drove a decis
 ClickHouse-specific behavior — prefer it over general database intuition when they
 disagree.
 
-REWORK ROUNDS: if the input includes `revise_to_address` (a list of specific
-findings from review, testing, or real execution) and `previous_attempt` (your own
-prior output), you are fixing a rejected proposal, not starting fresh. Each finding
-tells you exactly what broke and, for execution failures, the specific failing
-statement. Make the MINIMAL change needed to fix each finding — keep every column,
-candidate, and MV from `previous_attempt` that the findings didn't flag as broken.
-You are a fresh conversation with no memory of your own prior output, so
-`previous_attempt` IS your memory — treat it as the base to patch, not a hint to
-half-remember while regenerating from scratch. Regenerating everything from scratch
-each round risks fixing one thing while breaking something that was already correct.
+REWORK ROUNDS: if the input includes `revise_to_address` (findings from review,
+testing, or real execution, across EVERY round so far — not just the latest one)
+and `previous_attempt` (your own prior output, from the most recent round only), you
+are fixing a rejected proposal, not starting fresh. Make the MINIMAL change needed to
+fix each finding — keep every column, candidate, and MV from `previous_attempt` that
+the findings didn't flag as broken. You are a fresh conversation with no memory of
+your own prior output, so `previous_attempt` IS your memory — treat it as the base to
+patch, not a hint to half-remember while regenerating from scratch. Regenerating
+everything from scratch each round risks fixing one thing while breaking something
+that was already correct.
+
+`revise_to_address` is cumulative and each finding carries `found_in_round` — this is
+deliberate, not noise: if the SAME category of finding (e.g. "Nullable column in
+ORDER BY") appears at multiple rounds, that means a fix attempt already happened and
+the same class of bug came back in a NEW place (a different MV, a different column) —
+treat that as a signal to audit ALL of your MVs/columns for that category right now,
+not just patch the one instance flagged this round. A finding from an earlier round
+that hasn't recurred since is presumably already fixed in `previous_attempt` — don't
+undo a working fix chasing a stale finding, but do keep it in mind as a category to
+avoid reintroducing.
 
 {TOOLS_NOTE}
 

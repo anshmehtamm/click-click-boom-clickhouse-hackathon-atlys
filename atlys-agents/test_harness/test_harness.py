@@ -103,7 +103,17 @@ def run_new_table_tests(
     smoke_queries: list[tuple[str, str]],
     materialized_views: list[dict] | None = None,
     scratch_db: str = "atlys_staging",
+    ddl_only: bool = False,
 ) -> TestSuiteResult:
+    """`ddl_only=True`: skip insert_integrity, query_smoke, and each MV's query-logic
+    check — just create the base table (empty) and run every MV's real CREATE
+    statement(s) against scratch. This is a fast, data-free syntax/type check meant
+    to run BEFORE the reviewer sees the proposal at all, so a broken MV (e.g.
+    Nullable-in-ORDER-BY) triggers an immediate, cheap rework round instead of first
+    burning a reviewer LLM call and a full data-insert test cycle on a proposal that
+    was never going to execute. The full (ddl_only=False) run still happens after
+    review, unchanged — this doesn't replace that, it just catches the cheap,
+    mechanical class of failure earlier."""
     # database="atlys", not "default": MVs legitimately JOIN against existing real
     # tables using bare (unqualified) names, assuming the connection's default
     # database is atlys — matches how the agent reasons about it via list_tables.
@@ -123,39 +133,40 @@ def run_new_table_tests(
             f"SETTINGS allow_nullable_key = 1"
         )
 
-        # --- insert_integrity ---
-        t0 = time.perf_counter()
-        body = "\n".join(json.dumps(r, default=str) for r in sample_rows).encode("utf-8")
-        client.raw_insert(
-            scratch_table, insert_block=body, fmt="JSONEachRow",
-            settings={"input_format_skip_unknown_fields": 1},
-        )
-        actual_count = client.query(f"SELECT count() FROM {scratch_table}").result_rows[0][0]
-        elapsed = (time.perf_counter() - t0) * 1000
-        passed = actual_count == len(sample_rows)
-        results.append(TestResult(
-            description=f"insert integrity: {len(sample_rows)} rows in -> {actual_count} rows landed",
-            test_type="insert_integrity", query=f"INSERT INTO {table_name} ... ({len(sample_rows)} rows)",
-            passed=passed, actual=f"{actual_count} rows", duration_ms=round(elapsed, 2),
-        ))
-
-        # --- query_smoke ---
-        for description, query_template in smoke_queries:
-            q = query_template.format(table=scratch_table)
+        if not ddl_only:
+            # --- insert_integrity ---
             t0 = time.perf_counter()
-            try:
-                r = client.query(q)
-                elapsed = (time.perf_counter() - t0) * 1000
-                results.append(TestResult(
-                    description=description, test_type="query_smoke", query=q,
-                    passed=True, actual=f"ok, {r.row_count} rows returned", duration_ms=round(elapsed, 2),
-                ))
-            except Exception as e:
-                elapsed = (time.perf_counter() - t0) * 1000
-                results.append(TestResult(
-                    description=description, test_type="query_smoke", query=q,
-                    passed=False, actual=f"ERROR: {e}", duration_ms=round(elapsed, 2),
-                ))
+            body = "\n".join(json.dumps(r, default=str) for r in sample_rows).encode("utf-8")
+            client.raw_insert(
+                scratch_table, insert_block=body, fmt="JSONEachRow",
+                settings={"input_format_skip_unknown_fields": 1},
+            )
+            actual_count = client.query(f"SELECT count() FROM {scratch_table}").result_rows[0][0]
+            elapsed = (time.perf_counter() - t0) * 1000
+            passed = actual_count == len(sample_rows)
+            results.append(TestResult(
+                description=f"insert integrity: {len(sample_rows)} rows in -> {actual_count} rows landed",
+                test_type="insert_integrity", query=f"INSERT INTO {table_name} ... ({len(sample_rows)} rows)",
+                passed=passed, actual=f"{actual_count} rows", duration_ms=round(elapsed, 2),
+            ))
+
+            # --- query_smoke ---
+            for description, query_template in smoke_queries:
+                q = query_template.format(table=scratch_table)
+                t0 = time.perf_counter()
+                try:
+                    r = client.query(q)
+                    elapsed = (time.perf_counter() - t0) * 1000
+                    results.append(TestResult(
+                        description=description, test_type="query_smoke", query=q,
+                        passed=True, actual=f"ok, {r.row_count} rows returned", duration_ms=round(elapsed, 2),
+                    ))
+                except Exception as e:
+                    elapsed = (time.perf_counter() - t0) * 1000
+                    results.append(TestResult(
+                        description=description, test_type="query_smoke", query=q,
+                        passed=False, actual=f"ERROR: {e}", duration_ms=round(elapsed, 2),
+                    ))
 
         # --- mv_integrity: TWO checks per MV, both against scratch, before anything
         # touches production.
@@ -224,6 +235,11 @@ def run_new_table_tests(
 
                 if not ddl_ok:
                     continue  # don't bother query-testing a MV whose DDL doesn't even create
+
+                if ddl_only:
+                    continue  # DDL syntax is all this mode checks — scratch base table has no
+                    # data yet, so a query-logic check here would only prove the scratch table
+                    # is empty, not that the query logic is correct.
 
                 # First created object in this MV's own statements is its
                 # queryable data table in the common `CREATE TABLE target; CREATE

@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState, useLayoutEffect, useCallback } from 'react';
-import { X, FolderOpen, Play, Loader2, CheckCircle, XCircle, RotateCcw } from 'lucide-react';
+import { X, FolderOpen, Play, Loader2, CheckCircle, XCircle, RotateCcw, ExternalLink } from 'lucide-react';
 import { usePanelCtx } from '@/lib/panel-context';
 import { TraceViewer } from '@/components/trace/TraceViewer';
 import type { AgentEvent } from '@/components/trace/types';
@@ -145,10 +145,10 @@ export function AgentPanel() {
 
   // ── history mode: the real persisted trace (agent_meta.trace_events) for
   // how this spec was most recently ingested, same events/widgets as a live
-  // run — plus /runs just for the small status badge + insight banner in the
-  // header (not the trace content itself, which now comes from real events).
+  // run — plus /runs just for the small status badge in the header (not the
+  // trace content itself, which now comes from real events).
   const [historyEvents, setHistoryEvents]   = useState<AgentEvent[]>([]);
-  const [historyMeta,   setHistoryMeta]     = useState<{ status?: string; insightTitle?: string } | null>(null);
+  const [historyMeta,   setHistoryMeta]     = useState<{ status?: string } | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError,   setHistoryError]   = useState<string | null>(null);
 
@@ -162,10 +162,7 @@ export function AgentPanel() {
     ])
       .then(([eventsRes, runsRes]) => {
         setHistoryEvents((eventsRes.events ?? []).map(normalizeTraceEvent));
-        setHistoryMeta({
-          status: runsRes.proposals?.[0]?.status,
-          insightTitle: runsRes.insight?.title,
-        });
+        setHistoryMeta({ status: runsRes.proposals?.[0]?.status });
       })
       .catch(e => setHistoryError(String(e)))
       .finally(() => setHistoryLoading(false));
@@ -314,6 +311,13 @@ export function AgentPanel() {
 
   const success = result?.status === 'executed';
 
+  // Whichever event set is currently on screen (live ingest or history) —
+  // every event on a trace shares the same trace_url, so the first one found
+  // is enough.
+  const activeTraceUrl = panelMode === 'history'
+    ? historyEvents.find(e => e.trace_url)?.trace_url
+    : traceEvents.find(e => e.trace_url)?.trace_url;
+
   return (
     <div
       className="relative flex h-screen flex-shrink-0 flex-col border-l"
@@ -368,6 +372,13 @@ export function AgentPanel() {
           )}
         </div>
         <div className="flex items-center gap-2">
+          {activeTraceUrl && (
+            <a href={activeTraceUrl} target="_blank" rel="noopener noreferrer"
+              className="flex items-center gap-1 text-xs font-medium hover:opacity-70"
+              style={{ color: '#2563eb' }}>
+              View trace <ExternalLink className="h-3 w-3" />
+            </a>
+          )}
           {panelMode === 'new' && mode === 'done' && (
             <button onClick={reset} className="flex items-center gap-1 text-xs hover:opacity-70"
               style={{ color: '#7a7068' }}>
@@ -404,17 +415,7 @@ export function AgentPanel() {
               </p>
             )}
             {!historyLoading && historyEvents.length > 0 && (
-              <>
-                {historyMeta?.insightTitle && (
-                  <div className="mb-3 rounded-xl border p-3" style={{ borderColor: '#c7d2fe', backgroundColor: '#eef2ff' }}>
-                    <span className="text-[9px] font-bold uppercase tracking-widest block mb-1" style={{ color: '#4f46e5' }}>
-                      insight generated
-                    </span>
-                    <p className="text-sm font-medium" style={{ color: '#3730a3' }}>{historyMeta.insightTitle}</p>
-                  </div>
-                )}
-                <TraceViewer events={historyEvents} />
-              </>
+              <TraceViewer events={historyEvents} />
             )}
           </div>
         )}

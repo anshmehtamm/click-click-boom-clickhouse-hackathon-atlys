@@ -299,10 +299,12 @@ export function AgentPanel() {
   // /api/ingest's stderr handler forwards EVERY line from the Python
   // subprocess as a log entry, most classified 'trace'/'tool'/'warning' --
   // that's raw hyperdx/MCP logging passthrough, not agent activity (the real
-  // reasoning/tool-call trace now comes from trace_event/TraceViewer). Only
-  // init/complete/error are worth showing; the rest was pure noise sitting
-  // right under the real widgets.
-  const visibleLogs = logs.filter(l => l.stage === 'init' || l.stage === 'complete' || l.stage === 'error');
+  // reasoning/tool-call trace now comes from trace_event/TraceViewer). The
+  // 'init'/'complete' lines ("Initializing pipeline...", "Loaded N sample
+  // events...") were real but redundant too -- the live phase spinner and
+  // the status banner already say that. Only genuine errors are worth
+  // surfacing here.
+  const visibleLogs = logs.filter(l => l.stage === 'error');
 
   // ── folder picker ───────────────────────────────────────────────────────────
 
@@ -441,7 +443,7 @@ export function AgentPanel() {
               {historyMeta?.status && (
                 <span className="flex-shrink-0 text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded"
                   style={{ color: '#7a7068', backgroundColor: '#f0ece6' }}>
-                  {historyMeta.status}
+                  {historyMeta.status === 'executed' ? 'Completed' : 'Running'}
                 </span>
               )}
             </>

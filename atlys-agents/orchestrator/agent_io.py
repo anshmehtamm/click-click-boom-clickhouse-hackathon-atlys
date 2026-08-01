@@ -50,7 +50,8 @@ def _check_required_keys(parsed: dict, required_keys: list[str] | None, raw_text
 
 def _call_json_agent(
     agent_id: str, payload: dict, run, step: str,
-    required_keys: list[str] | None = None, reasoning_fn=None, **span_metadata,
+    required_keys: list[str] | None = None, reasoning_fn=None,
+    resume_from: str | None = None, **span_metadata,
 ) -> tuple[dict, object]:
     """Calls an agent expecting JSON back, with full LIVE tracing -- opens
     `run.span(step)` and logs each reasoning chunk / tool call the moment it
@@ -65,7 +66,15 @@ def _call_json_agent(
     summary from the parsed JSON (e.g. the proposer's own `rationale` field, or
     the reviewer's verdict + finding descriptions) for the dashboard's primary
     "thinking" display -- kept separate from the model's own raw reasoning
-    tokens (`model_reasoning`), which are always logged too, live, per turn."""
+    tokens (`model_reasoning`), which are always logged too, live, per turn.
+
+    `resume_from`: continue a PRIOR call's conversation (its AgentResult's
+    response_id) instead of starting fresh -- see agent_runner.runner.run_agent's
+    docstring. Used across rework revisions so e.g. the proposer's revision-2
+    call has real memory of its own revision-1 turn. The retry-on-bad-JSON
+    call (below) also resumes from the SAME `resume_from`, not from the failed
+    attempt's own response -- that failure is an orthogonal parse-shape issue,
+    not part of the cross-revision conversation being continued."""
     with run.span(step, **span_metadata):
         tool_idx = [0]
 
@@ -76,7 +85,7 @@ def _call_json_agent(
                 run.log(step=f"{step}_tool[{tool_idx[0]}]_{name}", input=input_, output=output_)
                 tool_idx[0] += 1
 
-        r = call_agent(agent_id, json.dumps(payload), on_event=on_event)
+        r = call_agent(agent_id, json.dumps(payload), on_event=on_event, resume_from=resume_from)
         try:
             parsed = _extract_json(r.output_text)
             _check_required_keys(parsed, required_keys, r.output_text)
@@ -93,7 +102,7 @@ def _call_json_agent(
                     )
                 ),
             }
-            r = call_agent(agent_id, json.dumps(retry_payload), on_event=on_event)
+            r = call_agent(agent_id, json.dumps(retry_payload), on_event=on_event, resume_from=resume_from)
             # Not wrapped in its own try/except: if the retry ALSO fails, this
             # raises AgentOutputError again and propagates out of this function
             # uncaught -- the caller's own except AgentOutputError (in

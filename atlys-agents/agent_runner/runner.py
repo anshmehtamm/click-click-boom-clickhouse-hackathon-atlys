@@ -49,6 +49,7 @@ class AgentResult:
     reasoning: str = ""
     usage: dict[str, int] = field(default_factory=dict)
     raw: dict = field(default_factory=dict)
+    response_id: str | None = None  # last response's id -- pass as resume_from to continue this exact conversation later
 
 
 def _headers() -> dict[str, str]:
@@ -99,12 +100,25 @@ def _execute_function_call(name: str, arguments_json: str) -> str:
     return mcp_tools.execute_tool(name, arguments_json)
 
 
-def run_agent(agent_key: str, input_text: str, timeout: int = 180, on_event=None) -> AgentResult:
+def run_agent(
+    agent_key: str, input_text: str, timeout: int = 180, on_event=None,
+    resume_from: str | None = None,
+) -> AgentResult:
     """Runs one agent to completion: sends the initial turn, then loops on any
     function_call items (executing each for real, against our own MCP servers or
     the skill-file reader) until the model produces a final message with no more
     pending calls. Uses previous_response_id chaining between turns -- confirmed
     working against OpenAI directly (unlike LibreChat's proxy).
+
+    `resume_from`: continue a PRIOR run_agent() call's conversation (pass its
+    AgentResult.response_id) instead of starting fresh. Used across rework
+    revisions -- e.g. the proposer's revision-2 call resumes revision-1's own
+    conversation instead of re-explaining the whole prior draft/findings in
+    text every time, giving it real memory of what it already said rather
+    than a re-summarized context dump. Costs nothing extra to wire: it's
+    exactly the same previous_response_id chaining already used for the
+    in-loop tool-calling turns below, just seeded from a PRIOR call's final
+    response instead of always starting from None.
 
     `on_event(kind, name, input, output)`, if given, fires LIVE as each reasoning
     chunk or tool call happens -- not batched until the whole loop finishes. That
@@ -114,17 +128,16 @@ def run_agent(agent_key: str, input_text: str, timeout: int = 180, on_event=None
     signal). `kind` is "reasoning" or "tool_call"; decoupled from tracing.Run so
     this module has no dependency on it -- the caller (orchestrator/agent_io.py)
     wires this to real run.log() calls."""
-    system_prompt = _build_system_prompt(agent_key)
     tools = _build_tools(agent_key)
 
     # OpenAI's json_object mode requires the literal word "json" somewhere in the
     # INPUT messages specifically -- having it in `instructions` does NOT satisfy
     # this (confirmed via a real 400: "Response input messages must contain the
-    # word 'json'..."). Every agent's payload happened to pass this by accident
-    # so far only because the proposer's sample_events pointer's filename ends in
-    # ".ndjson" (which contains "json" as a substring) -- reviewer/chronicler/
-    # analytics payloads have no such coincidence and would 400 reliably. Append
-    # a short, deterministic instruction so this is guaranteed, not accidental.
+    # word 'json'..."). Confirmed separately: this only needs to be satisfied
+    # ONCE on the first turn of a previous_response_id-chained conversation --
+    # true whether that's this call's own first turn, or (via resume_from) the
+    # first turn of the ORIGINAL conversation being resumed. Cheap to always
+    # include rather than track whether it's already been said once.
     input_text = f"{input_text}\n\n(Respond with a single valid JSON object as your final message, per your system instructions.)"
 
     # Strict json_schema (agent_runner/schemas.py) when defined -- guarantees
@@ -135,39 +148,30 @@ def run_agent(agent_key: str, input_text: str, timeout: int = 180, on_event=None
     # revision budget on JSON formatting instead of substance).
     text_format = _text_format(agent_key)
 
-    payload: dict = {
-        "model": MODEL,
-        "instructions": system_prompt,
-        "input": input_text,
-        "store": True,
-        "reasoning": REASONING,
-        "text": text_format,
-    }
-    if tools:
-        payload["tools"] = tools
-
     all_tool_calls: list[dict] = []
     reasoning_chunks: list[str] = []
     usage_totals = {"input": 0, "output": 0, "total": 0}
     last_response: dict = {}
-    previous_response_id: str | None = None
+    previous_response_id: str | None = resume_from
+    pending_input: str | list = input_text
 
     for _turn in range(MAX_TURNS):
+        turn_payload: dict = {
+            "model": MODEL,
+            "input": pending_input,
+            "store": True,
+            "reasoning": REASONING,
+            "text": text_format,
+        }
         if previous_response_id:
-            # Follow-up turn: only the new function_call_output items, chained
-            # off the previous response -- not the whole conversation again.
-            turn_payload = {
-                "model": MODEL,
-                "previous_response_id": previous_response_id,
-                "input": payload["input"],
-                "store": True,
-                "reasoning": REASONING,
-                "text": text_format,
-            }
-            if tools:
-                turn_payload["tools"] = tools
+            # Continuing a conversation (either an in-loop tool-calling turn,
+            # or turn 0 via resume_from) -- system prompt is already
+            # established, only the new items get sent.
+            turn_payload["previous_response_id"] = previous_response_id
         else:
-            turn_payload = payload
+            turn_payload["instructions"] = _build_system_prompt(agent_key)
+        if tools:
+            turn_payload["tools"] = tools
 
         resp = requests.post(OPENAI_RESPONSES_URL, headers=_headers(), json=turn_payload, timeout=timeout)
         resp.raise_for_status()
@@ -205,6 +209,7 @@ def run_agent(agent_key: str, input_text: str, timeout: int = 180, on_event=None
                 reasoning="\n\n".join(reasoning_chunks),
                 usage=usage_totals,
                 raw=last_response,
+                response_id=previous_response_id,
             )
 
         # Execute every function call for real, build the output items the next
@@ -224,7 +229,7 @@ def run_agent(agent_key: str, input_text: str, timeout: int = 180, on_event=None
                 "call_id": call_id,
                 "output": output,
             })
-        payload["input"] = next_input
+        pending_input = next_input
 
     # Exhausted MAX_TURNS without a final message -- surface what we have rather
     # than silently returning nothing.
@@ -234,4 +239,5 @@ def run_agent(agent_key: str, input_text: str, timeout: int = 180, on_event=None
         reasoning="\n\n".join(reasoning_chunks),
         usage=usage_totals,
         raw=last_response,
+        response_id=previous_response_id,
     )

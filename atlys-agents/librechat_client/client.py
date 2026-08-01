@@ -12,12 +12,12 @@ change beyond `agent_id` now meaning an agents/prompts.py AGENTS dict key
 (e.g. "instrumentation_proposer") instead of a LibreChat agent ID pulled from
 .env -- there is no LibreChat agent ID anymore, nothing to look up.
 
-`previous_response_id` is no longer a caller-facing concept: agent_runner.run_agent
-handles its own internal turn-to-turn chaining (confirmed working, unlike
-LibreChat's) as an implementation detail of finishing ONE agent invocation's tool
-loop. It was never meant to persist across separate invocations anyway (every
-rework round is a fresh conversation by design -- see agents/prompts.py's REWORK
-ROUNDS section).
+`previous_response_id` chaining is exposed here as `resume_from` -- pass a
+prior AgentResult.response_id to continue THAT conversation instead of
+starting fresh (orchestrator/pipeline.py uses this across rework revisions
+so the proposer/reviewer have real memory of their own prior turn instead of
+a re-summarized text dump each revision). See agent_runner.runner.run_agent's
+docstring for the full explanation.
 """
 from __future__ import annotations
 
@@ -26,13 +26,17 @@ from agent_runner import AgentResult, run_agent
 __all__ = ["AgentResult", "call_agent", "smoke_test"]
 
 
-def call_agent(agent_id: str, input_text: str, timeout: int = 180, on_event=None) -> AgentResult:
+def call_agent(
+    agent_id: str, input_text: str, timeout: int = 180, on_event=None,
+    resume_from: str | None = None,
+) -> AgentResult:
     """`agent_id` is an agents/prompts.py AGENTS dict key, e.g.
     "instrumentation_proposer" -- kept as the parameter name for compatibility
     with existing call sites, not because it's still a LibreChat identifier.
     `on_event(kind, name, input, output)` fires live during the tool-calling loop
-    -- see agent_runner.runner.run_agent's docstring."""
-    return run_agent(agent_id, input_text, timeout=timeout, on_event=on_event)
+    -- see agent_runner.runner.run_agent's docstring. `resume_from`: see module
+    docstring."""
+    return run_agent(agent_id, input_text, timeout=timeout, on_event=on_event, resume_from=resume_from)
 
 
 def smoke_test(agent_id: str) -> AgentResult:

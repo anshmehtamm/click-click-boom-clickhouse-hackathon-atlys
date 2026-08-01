@@ -9,6 +9,7 @@ import { SchemaWidget, TablesWidget } from './widgets/SchemaWidget';
 import { ContextLookupWidget, ContextIndexWidget } from './widgets/ContextWidget';
 import { SkillFileWidget, SkillListWidget } from './widgets/SkillWidget';
 import { GenerationWidget } from './widgets/GenerationWidget';
+import { ProposalWidget, ReviewWidget } from './widgets/ProposalReviewWidget';
 
 // Only thinking (reasoning/generation) and tool calls are shown here — the
 // pipeline's own span/trace/plain-log bookkeeping events are real but not
@@ -42,6 +43,12 @@ function ThinkingWidget({ event }: { event: AgentEvent }) {
 
 function EventWidget({ event }: { event: AgentEvent }) {
   if (event.kind === 'reasoning') return <ThinkingWidget event={event} />;
+  // Exactly what flows between the proposer and reviewer deserves real
+  // structure, not the generic JSON-dump treatment every other "generation"
+  // event gets — pipeline.py's step names are exactly "propose_generation"/
+  // "review_generation" (see orchestrator/pipeline.py's _propose/_review).
+  if (event.step === 'propose_generation') return <ProposalWidget event={event} />;
+  if (event.step === 'review_generation')  return <ReviewWidget event={event} />;
 
   const family = getEventFamily(event);
   const clean  = cleanToolName(event.step);

@@ -240,7 +240,11 @@ def _write_sample_scratch_file(sample_events: list[dict]) -> dict:
     }
 
 
-def _propose(run, spec_name: str, spec_markdown: str, sample_scratch_info: dict, prior_findings: list[dict] | None, previous_draft: dict | None) -> dict:
+def _propose(
+    run, spec_name: str, spec_markdown: str, sample_scratch_info: dict,
+    prior_findings: list[dict] | None, previous_draft: dict | None,
+    resume_from: str | None = None,
+) -> tuple[dict, str | None]:
     # sample_scratch_info is a small pointer (filename + counts), never the raw
     # events — computed once in ingest_spec via _write_sample_scratch_file, same
     # every round. Measured: 150 raw events serialize to ~66K characters (~16-20K
@@ -251,26 +255,29 @@ def _propose(run, spec_name: str, spec_markdown: str, sample_scratch_info: dict,
     # input this time.
     payload = {"spec_markdown": spec_markdown, "sample_events": sample_scratch_info}
     if prior_findings:
-        # previous_draft matters as much as the findings: each call to this agent
-        # is a fresh conversation with no memory of its own prior output (no
-        # previous_response_id chaining), so without the actual previous DDL/MVs it
-        # can only regenerate blind — re-guessing everything, not patching the one
-        # thing that was wrong, which risks introducing a NEW issue elsewhere.
+        # Sent explicitly even when resuming (resume_from) the proposer's own
+        # conversation: prior_findings is genuinely NEW information (the
+        # reviewer's critique, not something the proposer already knows), and
+        # previous_draft is a concrete, unambiguous anchor for "the actual
+        # previous DDL/MVs" alongside whatever it recalls from its own
+        # conversation history — belt and suspenders, cheap next to the
+        # revision-quality risk of relying on recall alone.
         payload["revise_to_address"] = prior_findings[-MAX_FINDINGS_IN_PAYLOAD:]
         payload["previous_attempt"] = previous_draft
-    result, _r = _call_json_agent(
+    result, r = _call_json_agent(
         "instrumentation_proposer", payload, run, "propose",
         required_keys=[
             "table_name", "columns_ddl", "ordering_key_candidates", "column_mapping",
             "materialized_views", "confidence", "rationale",
         ],
         reasoning_fn=lambda parsed: parsed.get("rationale"),
+        resume_from=resume_from,
         spec_name=spec_name,
     )
-    return result
+    return result, r.response_id
 
 
-def _review(run, proposal: dict) -> dict:
+def _review(run, proposal: dict, resume_from: str | None = None) -> tuple[dict, str | None]:
     payload = {"proposal": proposal}
 
     def _reasoning(parsed: dict) -> str:
@@ -279,12 +286,13 @@ def _review(run, proposal: dict) -> dict:
         )
         return f"{parsed.get('verdict', '?')}" + (f" — {findings_summary}" if findings_summary else "")
 
-    result, _r = _call_json_agent(
+    result, r = _call_json_agent(
         "context_reviewer", payload, run, "review",
         required_keys=["verdict", "findings"], reasoning_fn=_reasoning,
+        resume_from=resume_from,
         table_name=proposal.get("table_name"),
     )
-    return result
+    return result, r.response_id
 
 
 def _chronicle(run, executed_proposal: dict, spec_name: str) -> dict:
@@ -333,6 +341,15 @@ def ingest_spec(
         proposal_id = None
         final_proposal = None
         final_review = None
+        # Each agent's own conversation, resumed across rework revisions instead
+        # of starting fresh every time -- real memory of what it already
+        # said/did (see agent_runner/runner.py's resume_from docstring), not a
+        # replacement for prior_findings/previous_draft (kept as-is below;
+        # those are genuinely NEW information -- the reviewer's findings, the
+        # last concrete draft -- not something the model already has in its
+        # own conversation history).
+        propose_resume_id: str | None = None
+        review_resume_id: str | None = None
         # Cumulative across ALL rounds, not just the latest failure. Each round used
         # to overwrite prior_findings with only the newest failure, so the proposer
         # never saw the pattern across rounds — e.g. round 1 flags MV-A's Nullable
@@ -345,7 +362,10 @@ def ingest_spec(
 
         while True:
             try:
-                draft = _propose(run, spec_name, spec_markdown, sample_scratch_info, prior_findings, previous_draft)
+                draft, propose_resume_id = _propose(
+                    run, spec_name, spec_markdown, sample_scratch_info, prior_findings, previous_draft,
+                    resume_from=propose_resume_id,
+                )
             except AgentOutputError as e:
                 # _call_json_agent already retried once internally; this means
                 # it failed twice in a row. Treat like any other failure mode —
@@ -612,7 +632,7 @@ def ingest_spec(
                 )
 
             try:
-                review = _review(run, proposal)
+                review, review_resume_id = _review(run, proposal, resume_from=review_resume_id)
             except AgentOutputError as e:
                 # Reviewer failed to produce valid JSON twice in a row — treat as
                 # a request_changes with no specific findings (we don't know what

@@ -5,20 +5,19 @@ import { Plus } from 'lucide-react';
 import { openAgentPanel, openSpecHistory } from '@/lib/panel-context';
 import type { SpecSummary } from '../api/specs/route';
 
-const STATUS_META: Record<string, { color: string; label: string }> = {
-  executed:       { color: '#16a34a', label: 'Executed' },
-  approved:       { color: '#2563eb', label: 'Approved' },
-  pending_review: { color: '#d97706', label: 'Reviewing' },
-  needs_rework:   { color: '#ea580c', label: 'Reworking' },
-  rejected:       { color: '#dc2626', label: 'Rejected' },
-};
-
+// Only two states matter to a reader scanning this list: is it still going,
+// or is it done. schema_proposals' real status enum (drafted/pending_review/
+// needs_rework/approved/executed/rejected) is per-revision pipeline
+// bookkeeping — genuinely useful inside a run's own trace, just noise here.
 function StatusDot({ status }: { status: string }) {
-  const m = STATUS_META[status] ?? { color: '#9c9088', label: status };
+  const completed = status === 'executed';
+  const color = completed ? '#16a34a' : '#2563eb';
   return (
     <span className="flex items-center gap-1.5 min-w-0">
-      <span className="h-1.5 w-1.5 flex-shrink-0 rounded-full" style={{ backgroundColor: m.color }} />
-      <span className="text-[11px] font-medium truncate" style={{ color: '#4a4540' }}>{m.label}</span>
+      <span className="h-1.5 w-1.5 flex-shrink-0 rounded-full" style={{ backgroundColor: color }} />
+      <span className="text-[11px] font-medium truncate" style={{ color: '#4a4540' }}>
+        {completed ? 'Completed' : 'Running'}
+      </span>
     </span>
   );
 }

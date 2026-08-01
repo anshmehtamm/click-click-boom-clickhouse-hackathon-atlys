@@ -2,22 +2,24 @@
 import { useState } from 'react';
 import {
   ChevronRight, ChevronDown, Database, FolderTree, BookOpen, Terminal,
-  FileCode, Sparkles, GitBranch, Circle,
+  FileCode, Sparkles, GitBranch, Circle, Wrench, ShieldCheck,
 } from 'lucide-react';
 
 export const TOOL_META: Record<string, { icon: React.ComponentType<{ className?: string; style?: React.CSSProperties }>; label: string; accent: string; bg: string }> = {
-  sql_query:      { icon: Database,   label: 'ClickHouse Query', accent: '#d97706', bg: '#fffbeb' },
-  schema:         { icon: Database,   label: 'Schema',           accent: '#d97706', bg: '#fffbeb' },
-  tables:         { icon: Database,   label: 'Tables',           accent: '#d97706', bg: '#fffbeb' },
-  context_lookup: { icon: FolderTree, label: 'Context',          accent: '#0d9488', bg: '#f0fdfa' },
-  context_index:  { icon: FolderTree, label: 'Context Index',    accent: '#0d9488', bg: '#f0fdfa' },
-  skill_file:     { icon: BookOpen,   label: 'Skill',            accent: '#7c3aed', bg: '#faf5ff' },
-  skill_list:     { icon: BookOpen,   label: 'Skill Files',      accent: '#7c3aed', bg: '#faf5ff' },
-  python:         { icon: Terminal,   label: 'Python',           accent: '#16a34a', bg: '#f0fdf4' },
-  scratch:        { icon: FileCode,   label: 'Scratch File',     accent: '#64748b', bg: '#f8fafc' },
-  generation:     { icon: Sparkles,   label: 'Generation',       accent: '#4f46e5', bg: '#eef2ff' },
-  span:           { icon: GitBranch,  label: 'Span',             accent: '#6b7280', bg: '#f9fafb' },
-  other:          { icon: Circle,     label: '',                 accent: '#9ca3af', bg: '#f9fafb' },
+  sql_query:      { icon: Database,    label: 'ClickHouse Query', accent: '#d97706', bg: '#fffbeb' },
+  schema:         { icon: Database,    label: 'Schema',           accent: '#d97706', bg: '#fffbeb' },
+  tables:         { icon: Database,    label: 'Tables',           accent: '#d97706', bg: '#fffbeb' },
+  context_lookup: { icon: FolderTree,  label: 'Context',          accent: '#0d9488', bg: '#f0fdfa' },
+  context_index:  { icon: FolderTree,  label: 'Context Index',    accent: '#0d9488', bg: '#f0fdfa' },
+  skill_file:     { icon: BookOpen,    label: 'Skill',            accent: '#7c3aed', bg: '#faf5ff' },
+  skill_list:     { icon: BookOpen,    label: 'Skill Files',      accent: '#7c3aed', bg: '#faf5ff' },
+  python:         { icon: Terminal,    label: 'Python',           accent: '#16a34a', bg: '#f0fdf4' },
+  scratch:        { icon: FileCode,    label: 'Scratch File',     accent: '#64748b', bg: '#f8fafc' },
+  generation:     { icon: Sparkles,    label: 'Generation',       accent: '#4f46e5', bg: '#eef2ff' },
+  proposal:       { icon: Wrench,      label: 'Proposal',         accent: '#d97706', bg: '#fffbeb' },
+  review:         { icon: ShieldCheck, label: 'Review',           accent: '#2563eb', bg: '#eff6ff' },
+  span:           { icon: GitBranch,   label: 'Span',             accent: '#6b7280', bg: '#f9fafb' },
+  other:          { icon: Circle,      label: '',                 accent: '#9ca3af', bg: '#f9fafb' },
 };
 
 interface BaseWidgetProps {

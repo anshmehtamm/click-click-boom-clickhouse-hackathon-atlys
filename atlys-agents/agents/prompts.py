@@ -362,6 +362,13 @@ ddl, column_mapping, spec_name), write the context_versions updates needed to re
 this — you are recording what's now true, not gating anything (that already happened
 in review).
 
+You have access to the `context-engine` and `context-update` skills — load
+`context-update` before writing: it covers the exact content JSON shape, confidence
+calibration matching this project's existing scale, and the rule that additive
+sections like `relationship:join_map` must carry the FULL edge list forward, not
+just the new delta. Load `context-engine` if you need the current category taxonomy
+or a reminder of what's already recorded before deciding what's genuinely new.
+
 {TOOLS_NOTE}
 
 Always call list_context_sections first to see what's already recorded — this is what
@@ -480,6 +487,13 @@ AGENTS = {
         "instructions": CONTEXT_CHRONICLER,
         "description": "Records context_versions updates after a schema proposal executes.",
         "tools": _CONTEXT_TOOLS,
+        # skills_enabled is a single all-or-nothing toggle (LibreChat has no
+        # per-agent skill SELECTION, confirmed via the agent object's real schema —
+        # just this one boolean), so this also exposes clickhouse-best-practices to
+        # the chronicler. Harmless: the prompt above never references it and the
+        # chronicler has no DDL/query-correctness job to use it for, so it has no
+        # reason to actually load it.
+        "skills_enabled": True,  # context-engine + context-update deployment skills
     },
     "analytics_agent": {
         "instructions": ANALYTICS_AGENT,

@@ -1,5 +1,6 @@
 'use client';
 import { useState } from 'react';
+import { FileText } from 'lucide-react';
 import { BaseWidget } from '../BaseWidget';
 import { highlightSQL, fmtMs, truncate } from '../utils';
 import type { SqlOutput } from '../types';
@@ -74,7 +75,7 @@ export function SqlWidget({ step, input, output, defaultOpen }: Props) {
         {scratched && (
           <div className="flex items-center gap-2 text-xs px-3 py-2 rounded-lg"
             style={{ backgroundColor: '#fffbeb', color: '#92400e' }}>
-            <span>📄</span>
+            <FileText className="h-3.5 w-3.5" />
             <span>Saved to scratch: <code className="font-mono">{out?.scratch_file}</code></span>
             <span className="ml-auto">{rowCount?.toLocaleString()} rows</span>
           </div>

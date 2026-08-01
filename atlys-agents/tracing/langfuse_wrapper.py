@@ -29,7 +29,9 @@ Usage:
         trace_url = run.url   # store this on the agent_meta row you just wrote
 """
 import contextlib
+import json
 import logging
+import time
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -40,8 +42,43 @@ load_dotenv()
 # Import ClickStack integration (but don't initialize yet - we'll do it after first Langfuse call)
 from .hyperdx_integration import init_hyperdx, get_tracer, log_to_hyperdx
 from dashboard.emitter import emit_event
+from agent_meta.db import get_client as get_ch_client
 
 _clickstack_initialized = False
+
+
+def _stringify(v) -> str:
+    """input/output/usage/metadata are a mix of raw strings (tool outputs are
+    already strings) and Python objects (payloads, usage dicts) -- store both
+    as plain strings in trace_events (a String column, not JSON-typed) without
+    double-encoding an already-string value."""
+    if v is None:
+        return ""
+    return v if isinstance(v, str) else json.dumps(v, default=str)
+
+
+def _flush_trace_events(events: list[dict]) -> None:
+    """One bulk INSERT for the whole trace at traced_run()'s end, not one
+    INSERT per event -- a run emits dozens of events, and per-event inserts
+    against ClickHouse are exactly the anti-pattern this pipeline itself flags
+    to the proposer. Best-effort: a failure here must never take down the
+    pipeline run that already completed successfully."""
+    if not events:
+        return
+    try:
+        client = get_ch_client(database="agent_meta")
+        cols = ["ts", "trace_id", "trace_url", "agent", "spec_name", "step",
+                "event", "kind", "input", "output", "reasoning", "usage", "metadata"]
+        rows = [[
+            datetime.fromtimestamp(e.get("ts", time.time()), tz=timezone.utc),
+            e.get("trace_id", ""), e.get("trace_url", ""), e.get("agent", ""),
+            e.get("spec", ""), e.get("step", ""), e.get("event", ""), e.get("kind", ""),
+            _stringify(e.get("input")), _stringify(e.get("output")),
+            e.get("reasoning") or "", _stringify(e.get("usage")), _stringify(e.get("metadata")),
+        ] for e in events]
+        client.insert("trace_events", rows, column_names=cols)
+    except Exception:
+        logging.getLogger(__name__).exception("failed to persist trace_events (non-fatal)")
 
 
 def _step_kind(step: str) -> str:
@@ -68,6 +105,7 @@ class Run:
         self._root_span = root_span
         self.agent = agent
         self.spec = spec
+        self._events: list[dict] = []  # flushed to agent_meta.trace_events by traced_run()
 
     @property
     def trace_id(self) -> str:
@@ -92,8 +130,11 @@ class Run:
             **meta
         )
 
-        # Log to realtime dashboard (best-effort, see dashboard/emitter.py)
-        emit_event({
+        # Log to realtime dashboard (best-effort, see dashboard/emitter.py) and
+        # buffer for the durable batch insert at trace end (tracing/langfuse_wrapper.py's
+        # _flush_trace_events) -- built once, with an explicit ts, so the live
+        # POST and the persisted row agree on exactly when this happened.
+        event = {
             "event": "log",
             "kind": _step_kind(step),
             "trace_id": self.trace_id,
@@ -106,7 +147,10 @@ class Run:
             "reasoning": reasoning,
             "usage": usage,
             "metadata": metadata,
-        })
+            "ts": time.time(),
+        }
+        emit_event(event)
+        self._events.append(event)
 
         # Use "generation" type if usage data is provided (LLM call), otherwise "span"
         observation_type = "generation" if usage else "span"
@@ -138,12 +182,14 @@ class Run:
             langfuse_url=self.url,
             **metadata
         )
-        emit_event({
+        span_start_event = {
             "event": "span_start", "kind": "span",
             "trace_id": self.trace_id, "trace_url": self.url,
             "agent": self.agent, "spec": self.spec,
-            "step": name, "metadata": metadata,
-        })
+            "step": name, "metadata": metadata, "ts": time.time(),
+        }
+        emit_event(span_start_event)
+        self._events.append(span_start_event)
 
         with self._client.start_as_current_observation(
             name=name, as_type="span", metadata=metadata or None
@@ -159,12 +205,14 @@ class Run:
                     langfuse_url=self.url,
                     **metadata
                 )
-                emit_event({
+                span_end_event = {
                     "event": "span_end", "kind": "span",
                     "trace_id": self.trace_id, "trace_url": self.url,
                     "agent": self.agent, "spec": self.spec,
-                    "step": name, "metadata": metadata,
-                })
+                    "step": name, "metadata": metadata, "ts": time.time(),
+                }
+                emit_event(span_end_event)
+                self._events.append(span_end_event)
 
 
 @contextlib.contextmanager
@@ -202,11 +250,13 @@ def traced_run(agent: str, spec: str, **extra_tags):
                 spec=spec,
                 **extra_tags
             )
-            emit_event({
+            trace_start_event = {
                 "event": "trace_start", "kind": "trace",
                 "trace_id": run.trace_id, "trace_url": run.url,
-                "agent": agent, "spec": spec, "metadata": extra_tags,
-            })
+                "agent": agent, "spec": spec, "metadata": extra_tags, "ts": time.time(),
+            }
+            emit_event(trace_start_event)
+            run._events.append(trace_start_event)
 
             try:
                 yield run
@@ -221,9 +271,12 @@ def traced_run(agent: str, spec: str, **extra_tags):
                     spec=spec,
                     **extra_tags
                 )
-                emit_event({
+                trace_end_event = {
                     "event": "trace_end", "kind": "trace",
                     "trace_id": run.trace_id, "trace_url": run.url,
-                    "agent": agent, "spec": spec, "metadata": extra_tags,
-                })
+                    "agent": agent, "spec": spec, "metadata": extra_tags, "ts": time.time(),
+                }
+                emit_event(trace_end_event)
+                run._events.append(trace_end_event)
+                _flush_trace_events(run._events)
                 client.flush()

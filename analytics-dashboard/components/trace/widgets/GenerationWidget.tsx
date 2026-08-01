@@ -1,6 +1,6 @@
 'use client';
 import { useState } from 'react';
-import { ExternalLink } from 'lucide-react';
+import { ExternalLink, Brain } from 'lucide-react';
 import { BaseWidget } from '../BaseWidget';
 import { prettyJSON, truncate } from '../utils';
 import type { AgentEvent } from '../types';
@@ -21,8 +21,8 @@ function ReasoningBlock({ text }: { text: string }) {
   return (
     <div className="rounded-r-lg overflow-hidden" style={{ borderLeft: '2px solid #c4b5fd', backgroundColor: '#faf7ff' }}>
       <div className="px-3 pt-2 pb-1.5">
-        <span className="text-[9px] font-bold uppercase tracking-widest" style={{ color: '#8b5cf6' }}>
-          💭 model reasoning
+        <span className="flex items-center gap-1 text-[9px] font-bold uppercase tracking-widest" style={{ color: '#8b5cf6' }}>
+          <Brain className="h-2.5 w-2.5" /> model reasoning
         </span>
         <pre className="mt-1 text-[11.5px] leading-relaxed whitespace-pre-wrap font-sans"
           style={{ color: '#6d28d9', opacity: 0.8 }}>

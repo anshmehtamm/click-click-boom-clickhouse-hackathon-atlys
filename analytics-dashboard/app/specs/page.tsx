@@ -1,79 +1,81 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { useRouter } from 'next/navigation';
-import { Plus, ChevronRight, Clock, CheckCircle, XCircle, RotateCcw, AlertCircle } from 'lucide-react';
-import { openAgentPanel } from '@/lib/panel-context';
+import { Plus, Lightbulb } from 'lucide-react';
+import { openAgentPanel, openSpecHistory } from '@/lib/panel-context';
 import type { SpecSummary } from '../api/specs/route';
 
-const STATUS_META: Record<string, { color: string; bg: string; label: string; icon: React.ReactNode }> = {
-  executed:     { color: '#16a34a', bg: '#f0fdf4', label: 'Executed',      icon: <CheckCircle className="h-3.5 w-3.5" /> },
-  approved:     { color: '#2563eb', bg: '#eff6ff', label: 'Approved',      icon: <CheckCircle className="h-3.5 w-3.5" /> },
-  pending_review:{ color: '#d97706', bg: '#fffbeb', label: 'Reviewing',    icon: <RotateCcw className="h-3.5 w-3.5" /> },
-  needs_rework: { color: '#ea580c', bg: '#fff7ed', label: 'Reworking',     icon: <AlertCircle className="h-3.5 w-3.5" /> },
-  rejected:     { color: '#dc2626', bg: '#fef2f2', label: 'Rejected',      icon: <XCircle className="h-3.5 w-3.5" /> },
+const STATUS_META: Record<string, { color: string; label: string }> = {
+  executed:       { color: '#16a34a', label: 'Executed' },
+  approved:       { color: '#2563eb', label: 'Approved' },
+  pending_review: { color: '#d97706', label: 'Reviewing' },
+  needs_rework:   { color: '#ea580c', label: 'Reworking' },
+  rejected:       { color: '#dc2626', label: 'Rejected' },
 };
 
-function StatusBadge({ status }: { status: string }) {
-  const m = STATUS_META[status] ?? { color: '#9c9088', bg: '#faf8f5', label: status, icon: null };
+function StatusDot({ status }: { status: string }) {
+  const m = STATUS_META[status] ?? { color: '#9c9088', label: status };
   return (
-    <span className="flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-semibold"
-      style={{ color: m.color, backgroundColor: m.bg }}>
-      {m.icon}
-      {m.label}
+    <span className="flex items-center gap-1.5 min-w-0">
+      <span className="h-1.5 w-1.5 flex-shrink-0 rounded-full" style={{ backgroundColor: m.color }} />
+      <span className="text-[11px] font-medium truncate" style={{ color: '#4a4540' }}>{m.label}</span>
     </span>
   );
 }
 
-function ConfidenceBar({ value }: { value: number }) {
+function ConfidenceCell({ value }: { value: number }) {
+  if (!value) return <span style={{ color: '#c0b8b0' }}>—</span>;
   const pct = Math.round(value * 100);
   const color = pct >= 80 ? '#16a34a' : pct >= 60 ? '#d97706' : '#dc2626';
   return (
     <div className="flex items-center gap-2">
-      <div className="h-1.5 w-16 rounded-full overflow-hidden" style={{ backgroundColor: '#f0ece6' }}>
+      <div className="h-1 w-10 flex-shrink-0 rounded-full overflow-hidden" style={{ backgroundColor: '#f0ece6' }}>
         <div className="h-full rounded-full" style={{ width: `${pct}%`, backgroundColor: color }} />
       </div>
-      <span className="text-xs font-mono font-semibold" style={{ color }}>{pct}%</span>
+      <span className="text-[11px] font-mono tabular-nums" style={{ color: '#7a7068' }}>{pct}%</span>
     </div>
   );
 }
 
-function SpecCard({ spec }: { spec: SpecSummary }) {
-  const router = useRouter();
+// Column layout shared between header and body rows so everything lines up —
+// status is a fixed-width dot+label, name/table share the flexible middle,
+// confidence/insight/time are fixed-width and right-leaning (scannable,
+// like a file manager or job queue, not a card grid).
+const GRID_COLS = '96px minmax(0,1.3fr) minmax(0,1fr) 84px minmax(0,1.4fr) 92px';
+
+function SpecRow({ spec }: { spec: SpecSummary }) {
   return (
     <button
-      onClick={() => router.push(`/specs/${spec.spec_name}`)}
-      className="w-full rounded-2xl border p-5 text-left transition-all hover:shadow-sm hover:border-blue-200"
-      style={{ borderColor: '#e5dfd6', backgroundColor: '#ffffff' }}
+      onClick={() => openSpecHistory(spec.spec_name)}
+      className="w-full grid items-center gap-4 px-4 py-2.5 text-left transition-colors hover:bg-stone-50 border-b last:border-0"
+      style={{ gridTemplateColumns: GRID_COLS, borderColor: '#f0ece6' }}
     >
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2.5 mb-1">
-            <h3 className="text-sm font-semibold font-mono" style={{ color: '#1c1814' }}>
-              {spec.spec_name}
-            </h3>
-            <StatusBadge status={spec.latest_status} />
-          </div>
-          {spec.table_name && (
-            <p className="text-[11px] font-mono" style={{ color: '#9c9088' }}>
-              {spec.table_name}
-            </p>
-          )}
-          {spec.has_insight > 0 && spec.insight_title && (
-            <p className="mt-1.5 text-xs italic truncate" style={{ color: '#7a7068' }}>
-              "{spec.insight_title}"
-            </p>
-          )}
-        </div>
-        <div className="flex-shrink-0 flex flex-col items-end gap-2">
-          {spec.latest_confidence > 0 && <ConfidenceBar value={spec.latest_confidence} />}
-          <div className="flex items-center gap-1 text-[10px]" style={{ color: '#c0b8b0' }}>
-            <Clock className="h-3 w-3" />
-            {spec.last_run}
-          </div>
-        </div>
-        <ChevronRight className="h-4 w-4 flex-shrink-0 self-center" style={{ color: '#c0b8b0' }} />
-      </div>
+      <StatusDot status={spec.latest_status} />
+
+      <span className="text-[13px] font-semibold font-mono truncate" style={{ color: '#1c1814' }}>
+        {spec.spec_name}
+      </span>
+
+      <span className="text-[12px] font-mono truncate" style={{ color: '#9c9088' }}>
+        {spec.table_name || '—'}
+      </span>
+
+      <ConfidenceCell value={spec.latest_confidence} />
+
+      <span className="flex items-center gap-1.5 min-w-0 text-[12px] truncate" style={{ color: '#7a7068' }}>
+        {spec.has_insight > 0 && spec.insight_title ? (
+          <>
+            <Lightbulb className="h-3 w-3 flex-shrink-0" style={{ color: '#d97706' }} />
+            <span className="italic truncate">{spec.insight_title}</span>
+          </>
+        ) : (
+          <span style={{ color: '#c0b8b0' }}>—</span>
+        )}
+      </span>
+
+      <span className="text-[11px] font-mono tabular-nums text-right" style={{ color: '#c0b8b0' }}>
+        {spec.last_run.slice(5, 16).replace('T', ' ')}
+      </span>
     </button>
   );
 }
@@ -82,19 +84,26 @@ export default function SpecsPage() {
   const [specs,   setSpecs]   = useState<SpecSummary[]>([]);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
+  const refetch = () => {
     fetch('/api/specs')
       .then(r => r.json())
       .then(d => setSpecs(Array.isArray(d) ? d : []))
       .catch(() => setSpecs([]))
       .finally(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    refetch();
+    // agent-panel.tsx fires this after a successful new-spec run
+    window.addEventListener('specs-updated', refetch);
+    return () => window.removeEventListener('specs-updated', refetch);
   }, []);
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="flex h-full flex-col" style={{ backgroundColor: '#faf8f5' }}>
       {/* Header */}
       <div className="flex items-center justify-between border-b px-8 py-5"
-        style={{ borderColor: '#e5dfd6' }}>
+        style={{ borderColor: '#e5dfd6', backgroundColor: '#ffffff' }}>
         <div>
           <h1 className="text-lg font-semibold" style={{ color: '#1c1814' }}>Specs</h1>
           <p className="mt-0.5 text-sm" style={{ color: '#9c9088' }}>
@@ -103,7 +112,7 @@ export default function SpecsPage() {
         </div>
         <button
           onClick={openAgentPanel}
-          className="flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold text-white transition-opacity hover:opacity-90"
+          className="flex items-center gap-2 rounded-lg px-3.5 py-2 text-[13px] font-semibold text-white transition-opacity hover:opacity-90"
           style={{ backgroundColor: '#2563eb' }}>
           <Plus className="h-4 w-4" />
           New Spec
@@ -111,7 +120,7 @@ export default function SpecsPage() {
       </div>
 
       {/* Content */}
-      <div className="flex-1 overflow-y-auto px-8 py-8">
+      <div className="flex-1 overflow-y-auto px-8 py-6">
         {loading && (
           <div className="flex h-40 items-center justify-center">
             <p className="text-sm" style={{ color: '#9c9088' }}>Loading specs…</p>
@@ -138,8 +147,19 @@ export default function SpecsPage() {
         )}
 
         {!loading && specs.length > 0 && (
-          <div className="max-w-2xl space-y-3">
-            {specs.map(s => <SpecCard key={s.spec_name} spec={s} />)}
+          <div className="rounded-xl border overflow-hidden" style={{ borderColor: '#e5dfd6', backgroundColor: '#ffffff' }}>
+            {/* Column headers */}
+            <div className="grid items-center gap-4 px-4 py-2 border-b"
+              style={{ gridTemplateColumns: GRID_COLS, borderColor: '#e5dfd6', backgroundColor: '#faf8f5' }}>
+              {['Status', 'Spec', 'Table', 'Conf.', 'Insight', 'Last run'].map((h, i) => (
+                <span key={h}
+                  className={`text-[9.5px] font-bold uppercase tracking-widest ${i === 5 ? 'text-right' : ''}`}
+                  style={{ color: '#9c9088' }}>
+                  {h}
+                </span>
+              ))}
+            </div>
+            {specs.map(s => <SpecRow key={s.spec_name} spec={s} />)}
           </div>
         )}
       </div>

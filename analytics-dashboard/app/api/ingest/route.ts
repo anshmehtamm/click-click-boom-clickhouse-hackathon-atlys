@@ -140,6 +140,12 @@ except Exception as e:
             ...agentsEnv,
             PYTHONPATH: agentsDir,
             PYTHONUNBUFFERED: '1',
+            // dashboard/emitter.py: when set, every run.log()/span() event also
+            // prints as one JSON line (type: "trace_event") on stdout, in
+            // addition to its normal POST to the standalone 8787 dashboard.
+            // The stdout handler below already forwards any non-"result" JSON
+            // line straight through this SSE stream -- no extra parsing needed.
+            EMIT_TRACE_EVENTS_STDOUT: '1',
           },
         });
 

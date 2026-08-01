@@ -1,4 +1,4 @@
-export type EventKind = 'generation' | 'tool_call' | 'span_start' | 'span_end' | 'log' | 'trace_start' | 'trace_end';
+export type EventKind = 'generation' | 'reasoning' | 'tool_call' | 'span_start' | 'span_end' | 'log' | 'trace_start' | 'trace_end';
 
 export type ToolFamily =
   | 'sql_query' | 'schema' | 'tables'

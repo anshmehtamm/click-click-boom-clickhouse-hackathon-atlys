@@ -1,9 +1,10 @@
 'use client';
 
 import { useEffect, useRef, useState, useLayoutEffect, useCallback } from 'react';
-import { useRouter } from 'next/navigation';
 import { X, FolderOpen, Play, Loader2, CheckCircle, XCircle, RotateCcw } from 'lucide-react';
 import { usePanelCtx } from '@/lib/panel-context';
+import { TraceViewer } from '@/components/trace/TraceViewer';
+import type { AgentEvent } from '@/components/trace/types';
 
 // ── types ─────────────────────────────────────────────────────────────────────
 
@@ -56,6 +57,47 @@ function folderToSpecName(folder: string): string {
   return folder.replace(/^\d+_/, '');
 }
 
+// Tool-call input/output arrive as JSON-encoded STRINGS, not objects -- both
+// live (Python's runner.py logs the raw function_call.arguments string
+// straight through) and persisted (agent_meta.trace_events is a String
+// column, everything non-string gets json.dumps'd -- see langfuse_wrapper.py's
+// _stringify). The widgets (SqlWidget, PythonWidget, GenerationWidget's usage
+// display, ...) expect real objects, so parse back before handing off.
+function tryParseJSON(v: unknown): unknown {
+  if (typeof v !== 'string' || v === '') return v;
+  try { return JSON.parse(v); } catch { return v; }
+}
+
+// Handles two related-but-distinct raw shapes with one function:
+//   - live SSE trace_event: raw.ts in seconds, raw.spec, usage/metadata
+//     already objects (dashboard/emitter.py never stringifies them)
+//   - persisted /api/specs/[name]/events row: raw.ts_ms, raw.spec_name,
+//     usage/metadata as JSON strings (agent_meta.trace_events is all-String)
+function normalizeTraceEvent(raw: Record<string, any>): AgentEvent {
+  const rawKind: string = raw.kind ?? 'log';
+  const kind = ['span_start', 'span_end', 'trace_start', 'trace_end'].includes(raw.event)
+    ? raw.event
+    : rawKind;
+  const usage = tryParseJSON(raw.usage) as AgentEvent['usage'] | undefined;
+  const metadata = tryParseJSON(raw.metadata) as Record<string, any> | undefined;
+  return {
+    id: crypto.randomUUID(),
+    ts: raw.ts_ms ?? (raw.ts ?? Date.now() / 1000) * 1000,
+    kind,
+    step: raw.step ?? raw.event ?? '',
+    agent: raw.agent,
+    spec: raw.spec ?? raw.spec_name,
+    trace_id: raw.trace_id,
+    trace_url: raw.trace_url,
+    input: tryParseJSON(raw.input),
+    output: tryParseJSON(raw.output),
+    reasoning: raw.reasoning || undefined,
+    model_reasoning: metadata?.model_reasoning ?? undefined,
+    usage: usage && typeof usage === 'object' && Object.keys(usage).length ? usage : undefined,
+    n_tool_calls: metadata?.n_tool_calls,
+  };
+}
+
 // ── log row ───────────────────────────────────────────────────────────────────
 
 function LogRow({ entry }: { entry: LogEntry }) {
@@ -99,20 +141,49 @@ function LogRow({ entry }: { entry: LogEntry }) {
 // ── main panel ────────────────────────────────────────────────────────────────
 
 export function AgentPanel() {
-  const { close } = usePanelCtx();
-  const router    = useRouter();
+  const { close, mode: panelMode, historySpec } = usePanelCtx();
+
+  // ── history mode: the real persisted trace (agent_meta.trace_events) for
+  // how this spec was most recently ingested, same events/widgets as a live
+  // run — plus /runs just for the small status badge + insight banner in the
+  // header (not the trace content itself, which now comes from real events).
+  const [historyEvents, setHistoryEvents]   = useState<AgentEvent[]>([]);
+  const [historyMeta,   setHistoryMeta]     = useState<{ status?: string; insightTitle?: string } | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError,   setHistoryError]   = useState<string | null>(null);
+
+  useEffect(() => {
+    if (panelMode !== 'history' || !historySpec) return;
+    setHistoryLoading(true);
+    setHistoryError(null);
+    Promise.all([
+      fetch(`/api/specs/${historySpec}/events`).then(r => r.json()),
+      fetch(`/api/specs/${historySpec}/runs`).then(r => r.json()),
+    ])
+      .then(([eventsRes, runsRes]) => {
+        setHistoryEvents((eventsRes.events ?? []).map(normalizeTraceEvent));
+        setHistoryMeta({
+          status: runsRes.proposals?.[0]?.status,
+          insightTitle: runsRes.insight?.title,
+        });
+      })
+      .catch(e => setHistoryError(String(e)))
+      .finally(() => setHistoryLoading(false));
+  }, [panelMode, historySpec]);
 
   const [mode,     setMode]     = useState<Mode>('idle');
   const [specName, setSpecName] = useState('');
   const [specFile, setSpecFile] = useState<File | null>(null);
   const [eventsFile, setEventsFile] = useState<File | null>(null);
   const [logs,     setLogs]     = useState<LogEntry[]>([]);
+  const [traceEvents, setTraceEvents] = useState<AgentEvent[]>([]);
   const [result,   setResult]   = useState<RunResult | null>(null);
   const logsEndRef = useRef<HTMLDivElement>(null);
+  const traceEndRef = useRef<HTMLDivElement>(null);
   const folderRef  = useRef<HTMLInputElement>(null);
 
   // Resizable
-  const [width, setWidth] = useState(400);
+  const [width, setWidth] = useState(560);
   const dragging   = useRef(false);
   const dragStartX = useRef(0);
   const dragStartW = useRef(0);
@@ -129,7 +200,7 @@ export function AgentPanel() {
     const onMove = (e: MouseEvent) => {
       if (!dragging.current) return;
       const delta = dragStartX.current - e.clientX;
-      setWidth(Math.min(680, Math.max(300, dragStartW.current + delta)));
+      setWidth(Math.min(920, Math.max(300, dragStartW.current + delta)));
     };
     const onUp = () => {
       dragging.current = false;
@@ -142,6 +213,7 @@ export function AgentPanel() {
   }, []);
 
   useEffect(() => { logsEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [logs]);
+  useEffect(() => { traceEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [traceEvents]);
 
   const addLog = (stage: string, message: string) =>
     setLogs(prev => [...prev, { id: crypto.randomUUID(), stage, message, ts: Date.now() }]);
@@ -172,6 +244,7 @@ export function AgentPanel() {
     if (!specFile || !eventsFile) return;
     setMode('running');
     setLogs([]);
+    setTraceEvents([]);
     setResult(null);
 
     const specMarkdown = await specFile.text();
@@ -193,7 +266,9 @@ export function AgentPanel() {
           if (!line.startsWith('data: ')) continue;
           try {
             const data = JSON.parse(line.slice(6));
-            if (data.type === 'log') {
+            if (data.type === 'trace_event') {
+              setTraceEvents(prev => [...prev, normalizeTraceEvent(data)]);
+            } else if (data.type === 'log') {
               addLog(data.stage ?? 'info', data.message);
             } else if (data.type === 'complete') {
               setResult(data.result);
@@ -213,20 +288,23 @@ export function AgentPanel() {
     }
   };
 
-  // Auto-navigate on success
+  // On success, tell the specs list to refetch (it's the same panel that now
+  // opens on a spec click, so there's no longer a dedicated page to navigate
+  // to — just close and let the list pick up the new/updated row).
   useEffect(() => {
     if (mode === 'done' && result?.status === 'executed' && specName) {
       const t = setTimeout(() => {
-        router.push(`/specs/${specName}`);
+        window.dispatchEvent(new Event('specs-updated'));
         close();
       }, 1800);
       return () => clearTimeout(t);
     }
-  }, [mode, result, specName, router, close]);
+  }, [mode, result, specName, close]);
 
   const reset = () => {
     setMode('idle');
     setLogs([]);
+    setTraceEvents([]);
     setResult(null);
     setSpecName('');
     setSpecFile(null);
@@ -259,20 +337,38 @@ export function AgentPanel() {
       {/* Header */}
       <div className="flex h-14 flex-shrink-0 items-center justify-between border-b px-4"
         style={{ borderColor: '#e5dfd6' }}>
-        <div className="flex items-center gap-2">
-          {mode === 'running' && <Loader2 className="h-4 w-4 animate-spin text-blue-500" />}
-          {mode === 'done' && success   && <CheckCircle className="h-4 w-4 text-green-600" />}
-          {mode === 'done' && !success  && <XCircle className="h-4 w-4 text-red-500" />}
-          {(mode === 'idle' || mode === 'folder-selected') && <FolderOpen className="h-4 w-4" style={{ color: '#9c9088' }} />}
-          <span className="text-sm font-semibold" style={{ color: '#1c1814' }}>
-            {mode === 'idle' && 'New Spec'}
-            {mode === 'folder-selected' && specName}
-            {mode === 'running' && `Running ${specName}…`}
-            {mode === 'done' && (success ? 'Done' : 'Failed')}
-          </span>
+        <div className="flex items-center gap-2 min-w-0">
+          {panelMode === 'history' ? (
+            <>
+              {historyLoading && <Loader2 className="h-4 w-4 animate-spin text-blue-500 flex-shrink-0" />}
+              {!historyLoading && <FolderOpen className="h-4 w-4 flex-shrink-0" style={{ color: '#9c9088' }} />}
+              <span className="text-sm font-semibold font-mono truncate" style={{ color: '#1c1814' }}>
+                {historySpec}
+              </span>
+              {historyMeta?.status && (
+                <span className="flex-shrink-0 text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded"
+                  style={{ color: '#7a7068', backgroundColor: '#f0ece6' }}>
+                  {historyMeta.status}
+                </span>
+              )}
+            </>
+          ) : (
+            <>
+              {mode === 'running' && <Loader2 className="h-4 w-4 animate-spin text-blue-500" />}
+              {mode === 'done' && success   && <CheckCircle className="h-4 w-4 text-green-600" />}
+              {mode === 'done' && !success  && <XCircle className="h-4 w-4 text-red-500" />}
+              {(mode === 'idle' || mode === 'folder-selected') && <FolderOpen className="h-4 w-4" style={{ color: '#9c9088' }} />}
+              <span className="text-sm font-semibold" style={{ color: '#1c1814' }}>
+                {mode === 'idle' && 'New Spec'}
+                {mode === 'folder-selected' && specName}
+                {mode === 'running' && `Running ${specName}…`}
+                {mode === 'done' && (success ? 'Done' : 'Failed')}
+              </span>
+            </>
+          )}
         </div>
         <div className="flex items-center gap-2">
-          {mode === 'done' && (
+          {panelMode === 'new' && mode === 'done' && (
             <button onClick={reset} className="flex items-center gap-1 text-xs hover:opacity-70"
               style={{ color: '#7a7068' }}>
               <RotateCcw className="h-3 w-3" /> Run another
@@ -289,8 +385,42 @@ export function AgentPanel() {
       {/* Body */}
       <div className="flex-1 overflow-y-auto">
 
+        {/* HISTORY — how a past spec was ingested: reconstructed from
+            schema_proposals/schema_reviews as the same generation widgets
+            used live, no tool-call granularity (not persisted after a run
+            ends) but the real revision-by-revision propose/review story. */}
+        {panelMode === 'history' && (
+          <div className="p-4">
+            {historyLoading && (
+              <p className="py-8 text-center text-xs" style={{ color: '#c0b8b0' }}>Loading…</p>
+            )}
+            {historyError && (
+              <p className="py-8 text-center text-xs" style={{ color: '#dc2626' }}>{historyError}</p>
+            )}
+            {!historyLoading && !historyError && historyEvents.length === 0 && (
+              <p className="py-8 text-center text-xs" style={{ color: '#c0b8b0' }}>
+                No persisted trace for this spec — it may have been ingested before trace
+                persistence was added. Re-run it to see the full reasoning + tool-call history here.
+              </p>
+            )}
+            {!historyLoading && historyEvents.length > 0 && (
+              <>
+                {historyMeta?.insightTitle && (
+                  <div className="mb-3 rounded-xl border p-3" style={{ borderColor: '#c7d2fe', backgroundColor: '#eef2ff' }}>
+                    <span className="text-[9px] font-bold uppercase tracking-widest block mb-1" style={{ color: '#4f46e5' }}>
+                      insight generated
+                    </span>
+                    <p className="text-sm font-medium" style={{ color: '#3730a3' }}>{historyMeta.insightTitle}</p>
+                  </div>
+                )}
+                <TraceViewer events={historyEvents} />
+              </>
+            )}
+          </div>
+        )}
+
         {/* IDLE — prompt to pick a folder */}
-        {mode === 'idle' && (
+        {panelMode === 'new' && mode === 'idle' && (
           <div className="flex h-full flex-col items-center justify-center gap-4 p-8 text-center">
             <div className="flex h-16 w-16 items-center justify-center rounded-2xl"
               style={{ backgroundColor: '#f0ece6' }}>
@@ -354,25 +484,35 @@ export function AgentPanel() {
           </div>
         )}
 
-        {/* RUNNING — live log stream */}
+        {/* RUNNING — live agent trace: every reasoning step and tool call
+            rendered through the same per-tool widgets as the trace viewer,
+            as it happens (not a post-hoc replay) — driven directly by
+            dashboard/emitter.py's live event stream, no Langfuse fetch. */}
         {mode === 'running' && (
           <div className="p-4">
-            <div className="rounded-xl border p-3" style={{ borderColor: '#e5dfd6', backgroundColor: '#faf8f5' }}>
-              <div className="flex items-center gap-2 mb-2">
-                <Loader2 className="h-3.5 w-3.5 animate-spin text-blue-500" />
-                <p className="text-[10px] font-bold uppercase tracking-wider" style={{ color: '#9c9088' }}>
-                  Live output
-                </p>
-              </div>
-              <div className="max-h-[calc(100vh-180px)] overflow-y-auto">
-                {logs.length === 0 ? (
-                  <p className="py-4 text-center text-xs" style={{ color: '#c0b8b0' }}>Initializing…</p>
-                ) : (
-                  logs.map(l => <LogRow key={l.id} entry={l} />)
-                )}
-                <div ref={logsEndRef} />
-              </div>
+            <div className="flex items-center gap-2 mb-3">
+              <Loader2 className="h-3.5 w-3.5 animate-spin text-blue-500" />
+              <p className="text-[10px] font-bold uppercase tracking-wider" style={{ color: '#9c9088' }}>
+                Live trace
+              </p>
             </div>
+            {traceEvents.length === 0 && logs.length === 0 ? (
+              <p className="py-8 text-center text-xs" style={{ color: '#c0b8b0' }}>Initializing…</p>
+            ) : (
+              <>
+                {traceEvents.length > 0 && <TraceViewer events={traceEvents} />}
+                {/* Plain init/error/complete log lines aren't trace events
+                    (they come from the subprocess wrapper itself, not
+                    run.log()) — keep them visible below so nothing's lost. */}
+                {logs.length > 0 && (
+                  <div className="mt-3 rounded-xl border p-2.5" style={{ borderColor: '#e5dfd6', backgroundColor: '#faf8f5' }}>
+                    {logs.map(l => <LogRow key={l.id} entry={l} />)}
+                  </div>
+                )}
+                <div ref={traceEndRef} />
+                <div ref={logsEndRef} />
+              </>
+            )}
           </div>
         )}
 
@@ -396,7 +536,11 @@ export function AgentPanel() {
               )}
             </div>
 
-            {/* Log summary */}
+            {/* Full trace — every reasoning step and tool call from the run,
+                same widgets as while it was live. */}
+            {traceEvents.length > 0 && <TraceViewer events={traceEvents} />}
+
+            {/* Plain init/error/complete log lines */}
             {logs.length > 0 && (
               <details className="rounded-xl border overflow-hidden" style={{ borderColor: '#e5dfd6' }}>
                 <summary className="px-4 py-2.5 text-xs font-medium cursor-pointer hover:bg-stone-50"

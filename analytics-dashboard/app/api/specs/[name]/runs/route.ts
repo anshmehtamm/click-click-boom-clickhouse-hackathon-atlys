@@ -12,9 +12,9 @@ export const dynamic = 'force-dynamic';
 
 export async function GET(
   _req: NextRequest,
-  { params }: { params: { name: string } }
+  { params }: { params: Promise<{ name: string }> }
 ) {
-  const spec = params.name;
+  const { name: spec } = await params;
   try {
     // Latest proposal per revision (append-only, take argMax per proposal_id)
     const proposals = await client.query({

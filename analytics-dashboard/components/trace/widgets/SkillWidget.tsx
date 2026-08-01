@@ -1,4 +1,5 @@
 'use client';
+import { BookOpen } from 'lucide-react';
 import { BaseWidget } from '../BaseWidget';
 import type { SkillFileOutput } from '../types';
 
@@ -26,7 +27,7 @@ export function SkillFileWidget({ step, input, output, defaultOpen }: FileProps)
         {path && (
           <div className="flex items-center gap-2 text-[11px] font-mono px-2 py-1.5 rounded-lg"
             style={{ backgroundColor: '#faf5ff', color: '#7c3aed' }}>
-            <span>📘</span>
+            <BookOpen className="h-3.5 w-3.5" />
             <span>{path}</span>
             {sizeKB && <span className="ml-auto" style={{ color: '#a78bfa' }}>{sizeKB}</span>}
           </div>
@@ -60,10 +61,10 @@ export function SkillListWidget({ step, input, output, defaultOpen }: ListProps)
       defaultOpen={defaultOpen}
     >
       <div className="p-3.5">
-        <div className="rounded-lg border overflow-hidden divide-y" style={{ borderColor: '#ddd6fe', divideColor: '#ede9fe' }}>
+        <div className="rounded-lg border overflow-hidden" style={{ borderColor: '#ddd6fe' }}>
           {files.map((f, i) => (
-            <div key={i} className="flex items-center justify-between px-3 py-1.5 text-xs"
-              style={{ backgroundColor: i % 2 === 0 ? '#faf5ff' : '#ffffff' }}>
+            <div key={i} className="flex items-center justify-between px-3 py-1.5 text-xs border-b last:border-0"
+              style={{ backgroundColor: i % 2 === 0 ? '#faf5ff' : '#ffffff', borderColor: '#ede9fe' }}>
               <span className="font-mono" style={{ color: '#6d28d9' }}>{f.path}</span>
               {f.size_bytes && (
                 <span className="text-[10px]" style={{ color: '#a78bfa' }}>

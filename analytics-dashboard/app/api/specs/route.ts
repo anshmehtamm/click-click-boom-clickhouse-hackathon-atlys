@@ -34,10 +34,9 @@ export async function GET() {
           argMax(p.trace_url, p.ts)  AS trace_url,
           formatDateTime(max(p.ts), '%Y-%m-%d %H:%i:%s') AS last_run,
           count()                    AS total_proposals,
-          countIf(i.insight_id != '') AS has_insight,
-          argMax(i.title, p.ts)      AS insight_title
+          (SELECT count() FROM agent_meta.insights i WHERE i.spec_name = p.spec_name) AS has_insight,
+          (SELECT argMax(title, ts) FROM agent_meta.insights i WHERE i.spec_name = p.spec_name) AS insight_title
         FROM agent_meta.schema_proposals p
-        LEFT JOIN agent_meta.insights i ON p.spec_name = i.spec_name
         GROUP BY p.spec_name
         ORDER BY max(p.ts) DESC
       `,

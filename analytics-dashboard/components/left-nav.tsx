@@ -3,12 +3,15 @@
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { cn } from '@/lib/utils';
-import { FileText, Lightbulb, GitBranch } from 'lucide-react';
+import { FileText, Lightbulb } from 'lucide-react';
 
+// Traces used to be its own nav item, but a run's live trace (reasoning +
+// every tool call, same widgets) now renders directly in the run panel on
+// the right as it happens -- a separate historical-replay page is redundant
+// with that and was never wired to real data anyway (mock events only).
 const nav = [
   { name: 'Specs',    href: '/specs',    icon: FileText  },
   { name: 'Insights', href: '/insights', icon: Lightbulb },
-  { name: 'Traces',   href: '/traces',   icon: GitBranch },
 ];
 
 export function LeftNav() {

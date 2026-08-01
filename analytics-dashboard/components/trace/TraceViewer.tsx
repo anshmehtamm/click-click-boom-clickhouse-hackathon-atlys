@@ -1,7 +1,6 @@
 'use client';
-import { useState, useMemo } from 'react';
-import { ExternalLink } from 'lucide-react';
-import type { AgentEvent, ToolFamily } from './types';
+import { Brain } from 'lucide-react';
+import type { AgentEvent } from './types';
 import { getEventFamily, cleanToolName, elapsed } from './utils';
 import { SqlWidget } from './widgets/SqlWidget';
 import { PythonWidget } from './widgets/PythonWidget';
@@ -10,20 +9,39 @@ import { ContextLookupWidget, ContextIndexWidget } from './widgets/ContextWidget
 import { SkillFileWidget, SkillListWidget } from './widgets/SkillWidget';
 import { GenerationWidget } from './widgets/GenerationWidget';
 
-// ── Filter bar ────────────────────────────────────────────────────────────────
-
-const FILTER_OPTIONS: { label: string; family: ToolFamily | 'all' }[] = [
-  { label: 'All',      family: 'all' },
-  { label: '🛢 SQL',   family: 'sql_query' },
-  { label: '🐍 Python',family: 'python' },
-  { label: '🗂 Context',family: 'context_lookup' },
-  { label: '📘 Skill', family: 'skill_file' },
-  { label: '✦ LLM',   family: 'generation' },
-];
+// Only thinking (reasoning/generation) and tool calls are shown here — the
+// pipeline's own span/trace/plain-log bookkeeping events are real but not
+// useful to a reader watching the agent work, so they're dropped rather than
+// exposed behind a filter toggle.
+const VISIBLE_KINDS = new Set(['reasoning', 'generation', 'tool_call']);
 
 // ── Route event to correct widget ─────────────────────────────────────────────
 
+// Live per-turn chain-of-thought chunk (kind="reasoning", raw text in
+// `output`) -- distinct from a "generation" event's model_reasoning field
+// (the FINAL turn's reasoning, attached alongside the agent's structured
+// output). Same whisper visual language as GenerationWidget's reasoning
+// block, but standalone since these arrive as their own live events.
+function ThinkingWidget({ event }: { event: AgentEvent }) {
+  const text = typeof event.output === 'string' ? event.output : '';
+  if (!text.trim()) return null;
+  return (
+    <div className="rounded-r-lg overflow-hidden my-1" style={{ borderLeft: '2px solid #c4b5fd', backgroundColor: '#faf7ff' }}>
+      <div className="px-3 pt-2 pb-1.5">
+        <span className="flex items-center gap-1 text-[9px] font-bold uppercase tracking-widest" style={{ color: '#8b5cf6' }}>
+          <Brain className="h-2.5 w-2.5" /> thinking
+        </span>
+        <p className="mt-1 text-[11.5px] leading-relaxed whitespace-pre-wrap font-sans" style={{ color: '#6d28d9', opacity: 0.85 }}>
+          {text.trim()}
+        </p>
+      </div>
+    </div>
+  );
+}
+
 function EventWidget({ event }: { event: AgentEvent }) {
+  if (event.kind === 'reasoning') return <ThinkingWidget event={event} />;
+
   const family = getEventFamily(event);
   const clean  = cleanToolName(event.step);
 
@@ -59,99 +77,30 @@ function EventWidget({ event }: { event: AgentEvent }) {
   }
 }
 
-// ── Trace header ──────────────────────────────────────────────────────────────
-
-interface TraceHeaderProps {
-  agent?: string;
-  spec?: string;
-  traceUrl?: string;
-  eventCount: number;
-  filter: ToolFamily | 'all';
-  onFilterChange: (f: ToolFamily | 'all') => void;
-}
-
-function TraceHeader({ agent, spec, traceUrl, eventCount, filter, onFilterChange }: TraceHeaderProps) {
-  return (
-    <div className="border-b pb-3 mb-4 space-y-2.5" style={{ borderColor: '#e5dfd6' }}>
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-sm font-semibold" style={{ color: '#1c1814' }}>
-            {agent ?? 'pipeline'} · <span style={{ color: '#9c9088' }}>{spec}</span>
-          </h2>
-          <p className="text-[11px]" style={{ color: '#c0b8b0' }}>{eventCount} events</p>
-        </div>
-        {traceUrl && (
-          <a href={traceUrl} target="_blank" rel="noopener noreferrer"
-            className="flex items-center gap-1 text-xs font-medium hover:opacity-70"
-            style={{ color: '#2563eb' }}>
-            Langfuse <ExternalLink className="h-3 w-3" />
-          </a>
-        )}
-      </div>
-      {/* Filter bar */}
-      <div className="flex flex-wrap gap-1.5">
-        {FILTER_OPTIONS.map(opt => (
-          <button
-            key={opt.family}
-            onClick={() => onFilterChange(opt.family)}
-            className="text-[11px] px-2.5 py-1 rounded-full border transition-colors"
-            style={{
-              borderColor: filter === opt.family ? '#2563eb' : '#e5dfd6',
-              backgroundColor: filter === opt.family ? '#eff6ff' : '#ffffff',
-              color: filter === opt.family ? '#2563eb' : '#4a4540',
-              fontWeight: filter === opt.family ? 600 : 400,
-            }}>
-            {opt.label}
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-}
-
 // ── Main component ─────────────────────────────────────────────────────────────
+// No header, no filter bar, no external trace link — just the live thinking
+// + tool-call feed, in order, using each event's own widget.
 
 interface TraceViewerProps {
   events: AgentEvent[];
-  traceUrl?: string;
   className?: string;
 }
 
-export function TraceViewer({ events, traceUrl, className }: TraceViewerProps) {
-  const [filter, setFilter] = useState<ToolFamily | 'all'>('all');
+export function TraceViewer({ events, className }: TraceViewerProps) {
+  const visible = events.filter(ev => VISIBLE_KINDS.has(ev.kind));
 
-  const agent = events.find(e => e.agent)?.agent;
-  const spec  = events.find(e => e.spec)?.spec;
-  const url   = traceUrl ?? events.find(e => e.trace_url)?.trace_url;
-
-  const filtered = useMemo(() => {
-    if (filter === 'all') return events;
-    return events.filter(ev => {
-      const f = getEventFamily(ev);
-      if (filter === 'context_lookup') return f === 'context_lookup' || f === 'context_index';
-      if (filter === 'skill_file')     return f === 'skill_file' || f === 'skill_list';
-      return f === filter;
-    });
-  }, [events, filter]);
+  if (visible.length === 0) {
+    return (
+      <p className="text-center py-8 text-sm" style={{ color: '#c0b8b0' }}>
+        No activity yet.
+      </p>
+    );
+  }
 
   return (
     <div className={className}>
-      <TraceHeader
-        agent={agent}
-        spec={spec}
-        traceUrl={url}
-        eventCount={events.length}
-        filter={filter}
-        onFilterChange={setFilter}
-      />
       <div className="space-y-0.5">
-        {filtered.length === 0 ? (
-          <p className="text-center py-8 text-sm" style={{ color: '#c0b8b0' }}>
-            No events match this filter.
-          </p>
-        ) : (
-          filtered.map(ev => <EventWidget key={ev.id} event={ev} />)
-        )}
+        {visible.map(ev => <EventWidget key={ev.id} event={ev} />)}
       </div>
     </div>
   );

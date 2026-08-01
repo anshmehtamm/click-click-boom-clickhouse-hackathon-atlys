@@ -50,8 +50,12 @@ def create_agent(base_url: str, jwt: str, name: str, spec: dict) -> str:
             "description": spec["description"],
             "provider": "openAI",
             "model": MODEL,
-            "model_parameters": {"model": MODEL, "response_format": {"type": "json_object"}},
+            # reasoning_effort must be a real level (not "none"/unset) so LibreChat
+            # routes gpt-5.6 through the upstream Responses API — otherwise function
+            # tools + reasoning 400 on Chat Completions. See agents/prompts.py header.
+            "model_parameters": {"model": MODEL, "response_format": {"type": "json_object"}, "reasoning_effort": "low"},
             "instructions": spec["instructions"],
+            "tools": spec.get("tools", []),
         },
     )
     resp.raise_for_status()

@@ -172,6 +172,30 @@ Or from Python: `atlys-agents/.venv/bin/python -c "from librechat_client import 
 
 ---
 
+## 4. MCP tool servers — real tool access for the agents
+
+Two standalone MCP servers (not spawned by LibreChat — its container has no Python)
+give the agents genuine tool-calling loops instead of pre-bundled context dumps:
+
+```bash
+cd atlys-agents
+nohup .venv/bin/python mcp_servers/context_server.py > /tmp/context_mcp.log 2>&1 &   # :8100
+nohup ./mcp_servers/run_clickhouse_mcp.sh > /tmp/ch_mcp.log 2>&1 &                     # :8101, official mcp-clickhouse, read-only, scoped to `atlys`
+```
+
+Registered in `LibreChat/librechat.yaml` as `mcpServers.atlys_context` /
+`atlys_clickhouse`, pointing at `http://host.docker.internal:PORT/mcp` (Docker's
+bridge to the host). Also requires `mcpSettings.allowedDomains: [host.docker.internal]`
+— LibreChat's SSRF protection blocks unlisted domains by default (gotcha #8 below).
+
+Restart LibreChat's `api` container after changing `librechat.yaml` — bind-mounted
+file edits do **not** hot-reload; `docker compose up -d` won't recreate a running
+container just because the mounted file changed, you need `docker compose restart api`.
+
+Verify: `docker logs LibreChat | grep -A5 '\[MCP\]\[atlys'` should show both servers
+initialized with their tool lists. Then re-run `agents/create_agents.py` — it attaches
+each agent's tools from `agents/prompts.py`'s `AGENTS[...]["tools"]`.
+
 ## Gotchas hit while setting this up (save yourself the debugging time)
 
 1. **`librechat.yaml` not mounted by default.** Silent — server logs
@@ -201,6 +225,23 @@ Or from Python: `atlys-agents/.venv/bin/python -c "from librechat_client import 
    with auth errors, re-login before debugging anything else.
 7. **The Agents API key uses the endpoint `/api/api-keys`** (hyphenated) — `/api/apiKeys`
    404s.
+8. **MCP servers need an explicit domain allowlist.** `mcpServers` entries pointing at
+   `host.docker.internal` (or anywhere non-standard) fail with `Domain "..." is not
+   allowed` unless `mcpSettings.allowedDomains` in `librechat.yaml` includes it — SSRF
+   protection, off by default meaning nothing is allowed, not everything.
+9. **MCP HTTP transport tool names have a specific suffix format**: `{tool}_mcp_{serverName}`
+   (e.g. `run_query_mcp_atlys_clickhouse`) — this is what goes in an agent's `tools`
+   array; LibreChat resolves `mcpServerNames` from it server-side automatically.
+10. **`gpt-5.6` + function tools + reasoning fails on Chat Completions** unless
+    `reasoning_effort` is set to an actual level (`low`/`medium`/...), not `"none"` —
+    LibreChat only auto-routes gpt-5.6 through the upstream Responses API (which
+    supports tools+reasoning together) when reasoning_effort is a real level. Setting
+    it to `"none"` avoids the routing but also gives up reasoning depth — set a real
+    level instead, don't disable reasoning to dodge this.
+11. **Editing `mcp.client.streamable_http.streamable_http_client`'s context manager**:
+    it can yield either `(read, write)` or `(read, write, extra)` depending on which
+    server implementation you're talking to (our own MCPServer vs. FastMCP-based
+    mcp-clickhouse) — unpack defensively or check the SDK version per-server.
 
 ---
 

@@ -162,6 +162,12 @@ Design rules:
   low-cardinality, Nullable must be the inner type.
 - `columns_ddl` is ONLY the column definitions (no ENGINE/PARTITION/ORDER BY) — the
   orchestrator appends those once perf_tool picks a winner among your candidates.
+  Do NOT write `CREATE TABLE ...` yourself and do NOT wrap the whole thing in an
+  outer `(...)` — just the comma-separated column defs, e.g.
+  `event_id String, event_time DateTime64(3, 'UTC'), user_id String DEFAULT ''`.
+  The orchestrator builds `CREATE TABLE <table_name> (<columns_ddl>) ENGINE = ...`
+  itself; if columns_ddl already contains that wrapper, the result is a broken
+  double-wrapped statement.
 - Propose 2-3 `ordering_key_candidates`. Every candidate's ordering key must be built
   ONLY from non-Nullable columns (ClickHouse disallows Nullable in ORDER BY without a
   hygiene-degrading setting) — pick from id/timestamp/user_id/application_id or any
@@ -275,7 +281,9 @@ Output ONLY this JSON object:
   "ordering_key_candidates": [
     {{"label": "short_label", "ordering_key": "(col_a, col_b)", "partition_key": "toYYYYMM(timestamp)", "rationale": "what access pattern this favors"}}
   ],
-  "column_mapping": {{"raw_field_or_event": "column_name"}},
+  "column_mapping": [
+    {{"raw_field": "raw_field_or_event", "column_name": "column_name"}}
+  ],
   "pm_question_coverage": [
     {{"question": "quoted or paraphrased from the spec", "servable_by": "base_table | materialized_view", "note": "why"}}
   ],
@@ -453,7 +461,7 @@ Output ONLY this JSON object:
     {{
       "section": "table:express_checkout_events",
       "title": "...", "summary": "...", "body": "...",
-      "fields": {{}}, "sources": ["schema_proposals:<table_name>"],
+      "fields": "{{}}", "sources": ["schema_proposals:<table_name>"],
       "before": "", "diff_summary": "...", "rationale": "...", "confidence": 0.0
     }}
   ]

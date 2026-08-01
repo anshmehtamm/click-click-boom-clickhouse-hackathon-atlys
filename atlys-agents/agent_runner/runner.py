@@ -29,7 +29,7 @@ import requests
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from agents.prompts import AGENTS  # noqa: E402
-from agent_runner import mcp_tools, skills  # noqa: E402
+from agent_runner import mcp_tools, schemas, skills  # noqa: E402
 
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 MODEL = "gpt-5.6-luna"
@@ -75,6 +75,18 @@ def _build_tools(agent_key: str) -> list[dict]:
     return defs
 
 
+def _text_format(agent_key: str) -> dict:
+    """Strict json_schema when this agent has one defined (guarantees every
+    required key/type in the final message, not just "valid JSON" -- see
+    agent_runner/schemas.py's module docstring for why json_object mode alone
+    proved insufficient on real runs). Falls back to plain json_object for any
+    agent without a defined schema, rather than no constraint at all."""
+    schema = schemas.SCHEMAS.get(agent_key)
+    if schema:
+        return {"format": {"type": "json_schema", "name": f"{agent_key}_output", "strict": True, "schema": schema}}
+    return {"format": {"type": "json_object"}}
+
+
 def _execute_function_call(name: str, arguments_json: str) -> str:
     if name in ("read_skill_file", "list_skill_files"):
         try:
@@ -115,28 +127,21 @@ def run_agent(agent_key: str, input_text: str, timeout: int = 180, on_event=None
     # a short, deterministic instruction so this is guaranteed, not accidental.
     input_text = f"{input_text}\n\n(Respond with a single valid JSON object as your final message, per your system instructions.)"
 
+    # Strict json_schema (agent_runner/schemas.py) when defined -- guarantees
+    # every required key/type in the final message at the API level, not just
+    # "valid JSON" (json_object mode alone let real runs drift on a DIFFERENT
+    # malformed field almost every revision -- column_mapping, then
+    # ordering_key_candidates, then columns_ddl twice -- burning an entire
+    # revision budget on JSON formatting instead of substance).
+    text_format = _text_format(agent_key)
+
     payload: dict = {
         "model": MODEL,
         "instructions": system_prompt,
         "input": input_text,
         "store": True,
         "reasoning": REASONING,
-        # Every agent's prompt ends in "Output ONLY this JSON object" -- but
-        # nothing enforced that until this was added. LibreChat's config had
-        # response_format: {"type": "json_object"}; the initial version of this
-        # runner omitted the equivalent entirely, which is the actual reason a
-        # real run wrote a markdown "measurement plan" instead of JSON after
-        # extensive tool exploration -- not something inherent to using OpenAI
-        # directly, a real gap in this file. json_object guarantees syntactically
-        # valid JSON; it does NOT guarantee the nested schema (every required key
-        # present, right types) -- OpenAI's strict json_schema structured-outputs
-        # mode does guarantee that too (verified working together with tool
-        # calling), but converting to it means reshaping a few genuinely dynamic
-        # key-value fields (column_mapping, chronicler's `fields`) into
-        # schema-expressible shapes, which touches prompts.py's documented
-        # schemas AND the pipeline code that consumes them -- planned as a
-        # separate, properly-scoped follow-up rather than rushed in here.
-        "text": {"format": {"type": "json_object"}},
+        "text": text_format,
     }
     if tools:
         payload["tools"] = tools
@@ -157,7 +162,7 @@ def run_agent(agent_key: str, input_text: str, timeout: int = 180, on_event=None
                 "input": payload["input"],
                 "store": True,
                 "reasoning": REASONING,
-                "text": {"format": {"type": "json_object"}},
+                "text": text_format,
             }
             if tools:
                 turn_payload["tools"] = tools

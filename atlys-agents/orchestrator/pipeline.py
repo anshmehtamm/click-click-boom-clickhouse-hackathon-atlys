@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import time
 import uuid
 from collections import Counter
@@ -54,6 +55,17 @@ def _get_nested(d: dict, dotted_key: str):
             return None
         cur = cur[part]
     return cur
+
+
+def _column_mapping_to_dict(column_mapping) -> dict[str, str]:
+    """agent_runner/schemas.py's strict json_schema reshapes column_mapping from
+    {raw_field: column_name} to [{raw_field, column_name}, ...] -- strict mode can't
+    express a dynamic-key object. Converts back to the dict every consumer here
+    still expects. Also accepts a plain dict for robustness (e.g. if an agent
+    without a strict schema ever supplies this field)."""
+    if isinstance(column_mapping, dict):
+        return column_mapping
+    return {entry["raw_field"]: entry["column_name"] for entry in column_mapping}
 
 
 def _flatten_events(events: list[dict], column_mapping: dict[str, str]) -> list[dict]:
@@ -332,8 +344,28 @@ def ingest_spec(
             # Strip it here, once, rather than trusting every downstream
             # CREATE-statement builder to defend against it independently.
             cols = draft.get("columns_ddl", "").strip()
+            # Stronger version of the same failure: a real run on this branch (after
+            # strict json_schema was already active, so this ISN'T a JSON-shape
+            # problem -- columns_ddl is a free-form string the schema can't validate
+            # DDL syntax inside) had the proposer write a FULL `CREATE TABLE name
+            # (...) ENGINE = ... ORDER BY ...` statement into columns_ddl three
+            # revisions in a row, despite the prompt saying column-defs-only. Extract
+            # just the column-def body when this happens instead of only trusting
+            # the model to comply — greedy match backtracks to the LAST `)` before
+            # ENGINE/end, which is correct even with nested parens in column types
+            # like LowCardinality(Nullable(String)).
+            # Requires the literal ENGINE keyword right after the columns' closing
+            # paren -- NOT optional. An earlier version made it optional and matched
+            # greedily to the string's last ")" instead, which is WRONG whenever
+            # ORDER BY/PARTITION BY (which come after ENGINE) themselves contain
+            # parens, e.g. "... ) ENGINE = MergeTree ... ORDER BY (event_date)" —
+            # greedy backtracking found ORDER BY's closing paren, not the columns'.
+            m = re.search(r"CREATE\s+TABLE\b.*?\((.*)\)\s*ENGINE\b", cols, re.IGNORECASE | re.DOTALL)
+            if m:
+                cols = m.group(1).strip()
             if cols.startswith("(") and cols.endswith(")"):
-                draft["columns_ddl"] = cols[1:-1].strip()
+                cols = cols[1:-1].strip()
+            draft["columns_ddl"] = cols
 
             previous_draft = draft
             # full_events, not sample_events: perf test, test harness (whose
@@ -351,7 +383,7 @@ def ingest_spec(
             # every possible way a field can be malformed in advance -- catch the
             # structural error where it actually happens and feed it back.
             try:
-                flattened_events = _flatten_events(full_events, draft.get("column_mapping", {}))
+                flattened_events = _flatten_events(full_events, _column_mapping_to_dict(draft.get("column_mapping", [])))
             except (KeyError, TypeError, AttributeError) as e:
                 run.log(step="propose_malformed_column_mapping", input=draft.get("column_mapping"), output=str(e))
                 if revision >= MAX_REVISIONS:
@@ -359,8 +391,8 @@ def ingest_spec(
                 revision += 1
                 prior_findings = _record_findings(finding_history, [{
                     "severity": "block", "category": "invalid_json",
-                    "description": f"column_mapping is malformed ({e}). It must be a flat {{raw_field_or_event: column_name}} mapping — every value must be a plain string column name, not a nested object.",
-                    "suggested_fix": "Fix column_mapping so every value is a simple string (the target column name), not a dict/list.",
+                    "description": f"column_mapping is malformed ({e}). It must be an array of {{raw_field, column_name}} pairs — column_name must be a plain string, not a nested object.",
+                    "suggested_fix": "Fix column_mapping so every entry has string raw_field and column_name values, not a dict/list for column_name.",
                 }], revision)
                 continue
 
@@ -459,7 +491,7 @@ def ingest_spec(
             proposal = {
                 "table_name": draft["table_name"], "columns_ddl": draft["columns_ddl"], "ddl": ddl,
                 "ordering_key": winner.ordering_key,
-                "partition_key": winner.partition_key, "column_mapping": draft.get("column_mapping", {}),
+                "partition_key": winner.partition_key, "column_mapping": _column_mapping_to_dict(draft.get("column_mapping", [])),
                 "materialized_views": mvs,
                 "confidence": draft.get("confidence", 0.5),
                 # _as_text: a real run returned rationale as a list of bullet
@@ -650,7 +682,19 @@ def ingest_spec(
                                 time.sleep(1)
                             run.log(step="refreshable_mv_synced", input=mv_name, output={"status": status_rows[0][0] if status_rows else "unknown"})
 
-                    run.log(step="executed", input=None, output={"table": f"atlys.{final_proposal['table_name']}"})
+                    run.log(
+                        step="executed",
+                        input=None,
+                        output={
+                            "base_table": f"atlys.{final_proposal['table_name']}",
+                            "base_table_ddl": final_proposal["ddl"],
+                            "rows_inserted": len(final_flattened_events) if final_flattened_events else 0,
+                            "materialized_views": [
+                                {"name": f"atlys.{mv.get('name')}", "ddl": mv.get("ddl", "")}
+                                for mv in final_proposal.get("materialized_views", [])
+                            ],
+                        },
+                    )
             except Exception as e:
                 failed_label, failed_stmt = executing or ("unknown", "")
                 run.log(step="execute_error", input={"failed_object": failed_label, "statement": failed_stmt}, output=str(e))
@@ -685,6 +729,21 @@ def ingest_spec(
             try:
                 chronicle = _chronicle(run, final_proposal, spec_name)
                 _write_context_sections(meta_client, chronicle["sections"], run.url)
+                run.log(
+                    step="context_updated",
+                    input=None,
+                    output={
+                        "sections": [
+                            {
+                                "section": s.get("section"),
+                                "title": s.get("title"),
+                                "is_new": not s.get("before"),
+                                "diff_summary": s.get("diff_summary"),
+                            }
+                            for s in chronicle["sections"]
+                        ],
+                    },
+                )
             except AgentOutputError as e:
                 # The schema itself is already executed and real — don't discard a
                 # successful run because the context-layer writeup failed. Surface

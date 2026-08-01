@@ -235,14 +235,26 @@ def run_new_table_tests(
                     name_map[mv_name] = mv_data_names[first_key]
 
                 select_sql = _substitute_names(_extract_select(mv["ddl"]), name_map)
+                # Wrapped in `SELECT count() FROM (...)` rather than run raw: MVs that
+                # aggregate with *State combinators (minState, argMinState, etc. — the
+                # standard pattern for a mergeable rollup) return AggregateFunction(...)
+                # columns, which clickhouse-connect cannot deserialize client-side (it's
+                # an opaque binary state meant to be read via -Merge, not fetched raw).
+                # This check only needs to confirm the query's joins/filters/expressions
+                # execute and produce rows — count() sidesteps per-column deserialization
+                # entirely while still exercising the real logic. Found via a live
+                # failure: "AggregateFunction(min, DateTime) deserialization not
+                # supported" on an otherwise-correct funnel MV.
+                count_sql = f"SELECT count() FROM ({select_sql})"
                 t0 = time.perf_counter()
                 try:
-                    r = client.query(select_sql)
+                    r = client.query(count_sql)
+                    row_count = r.result_rows[0][0] if r.result_rows else 0
                     elapsed = (time.perf_counter() - t0) * 1000
                     results.append(TestResult(
                         description=f"MV '{mv_name}' query logic ({mv.get('answers_pm_question', '')})",
                         test_type="mv_integrity", query=select_sql,
-                        passed=True, actual=f"ok, {r.row_count} rows returned", duration_ms=round(elapsed, 2),
+                        passed=True, actual=f"ok, {row_count} rows produced", duration_ms=round(elapsed, 2),
                     ))
                 except Exception as e:
                     elapsed = (time.perf_counter() - t0) * 1000

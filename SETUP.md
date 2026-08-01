@@ -196,6 +196,63 @@ Verify: `docker logs LibreChat | grep -A5 '\[MCP\]\[atlys'` should show both ser
 initialized with their tool lists. Then re-run `agents/create_agents.py` — it attaches
 each agent's tools from `agents/prompts.py`'s `AGENTS[...]["tools"]`.
 
+---
+
+## 5. ClickStack Observability — traces & logs to ClickHouse Cloud (OPTIONAL)
+
+**This step is completely optional.** Agents work normally without it - they always send traces to Langfuse. ClickStack adds a secondary destination (ClickHouse Cloud) for centralized observability and querying.
+
+If configured, all agent traces and logs are automatically sent to ClickHouse Cloud via the ClickStack OpenTelemetry collector. This provides centralized observability with cross-references to Langfuse traces.
+
+### Start the collector:
+
+```bash
+cd atlys-agents
+docker-compose up -d
+```
+
+This starts the ClickStack OTEL collector on:
+- Port 4317 (OTLP gRPC)
+- Port 4318 (OTLP HTTP)
+
+The collector automatically:
+- Receives all OpenTelemetry traces from the Python agents
+- Forwards them to your ClickHouse Cloud instance
+- Stores traces in `otel_traces`, `otel_logs`, and `otel_metrics` tables
+- Preserves Langfuse trace IDs for cross-referencing
+
+### Verify it's working:
+
+```bash
+docker-compose ps        # check collector is running
+docker-compose logs -f   # watch collector logs
+```
+
+### Query traces in ClickHouse:
+
+```sql
+SELECT
+    TraceId,
+    ServiceName,
+    SpanName,
+    Timestamp,
+    SpanAttributes['langfuse_url'] as langfuse_url
+FROM default.otel_traces
+WHERE ServiceName = 'atlys-agents'
+ORDER BY Timestamp DESC
+LIMIT 100;
+```
+
+Every trace includes the Langfuse URL in its attributes, allowing you to correlate between ClickHouse and Langfuse views.
+
+### Stop the collector:
+
+```bash
+docker-compose down
+```
+
+---
+
 ## Gotchas hit while setting this up (save yourself the debugging time)
 
 1. **`librechat.yaml` not mounted by default.** Silent — server logs

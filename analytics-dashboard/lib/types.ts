@@ -2,13 +2,14 @@
 
 export interface Insight {
   insight_id: string;
-  spec_id: string;
-  agent_run_id: string;
-  question: string;
-  answer_text: string;
-  confidence_score: number; // 0.0 - 1.0
-  supporting_evidence: string; // JSON array of evidence objects
-  contradicting_signals: string; // JSON array
+  spec_name: string;
+  title: string;
+  summary: string;
+  confidence: number; // 0.0 - 1.0
+  evidence: string; // JSON string, currently just {confidence_drivers}
+  related_known_issues: string[];
+  segment_cuts: string[];
+  has_report: boolean; // report_html is non-empty — fetch /api/insights/[id]/report to view
   created_at: string;
   trace_url: string | null;
 }

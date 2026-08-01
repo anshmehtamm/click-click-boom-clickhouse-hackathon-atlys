@@ -1,7 +1,8 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { ExternalLink, TrendingUp, AlertCircle } from 'lucide-react';
+import Link from 'next/link';
+import { ExternalLink, ArrowRight, TrendingUp, AlertCircle } from 'lucide-react';
 
 // ── types ─────────────────────────────────────────────────────────────────────
 
@@ -37,6 +38,7 @@ interface Insight {
   evidence: string;
   related_known_issues: string[];
   segment_cuts: string[];
+  has_report: boolean;
   created_at: string;
   trace_url: string | null;
 }
@@ -254,13 +256,22 @@ function InsightCard({ ins }: { ins: Insight }) {
         <span className="text-xs" style={{ color: '#c0b8b0' }}>
           {ins.spec_name} · {ins.created_at}
         </span>
-        {ins.trace_url && (
-          <a href={ins.trace_url} target="_blank" rel="noopener noreferrer"
-            className="flex items-center gap-1 text-xs font-medium hover:opacity-70"
-            style={{ color: '#2563eb' }}>
-            View trace <ExternalLink className="h-3 w-3" />
-          </a>
-        )}
+        <div className="flex items-center gap-4">
+          {ins.has_report && (
+            <Link href={`/insights/${ins.insight_id}`}
+              className="flex items-center gap-1 text-xs font-semibold hover:opacity-70"
+              style={{ color: '#1c1814' }}>
+              View full report <ArrowRight className="h-3 w-3" />
+            </Link>
+          )}
+          {ins.trace_url && (
+            <a href={ins.trace_url} target="_blank" rel="noopener noreferrer"
+              className="flex items-center gap-1 text-xs font-medium hover:opacity-70"
+              style={{ color: '#2563eb' }}>
+              View trace <ExternalLink className="h-3 w-3" />
+            </a>
+          )}
+        </div>
       </div>
     </div>
   );

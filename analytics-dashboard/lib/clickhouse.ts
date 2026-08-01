@@ -20,6 +20,7 @@ export async function getInsights(limit = 50): Promise<Insight[]> {
         evidence,
         related_known_issues,
         segment_cuts,
+        length(report_html) > 0 as has_report,
         formatDateTime(ts, '%Y-%m-%d %H:%i:%s') as created_at,
         trace_url
       FROM agent_meta.insights
@@ -29,8 +30,26 @@ export async function getInsights(limit = 50): Promise<Insight[]> {
     format: 'JSONEachRow',
   });
 
-  const data = await result.json<Insight[]>();
+  const data = await result.json<Insight>();
   return data;
+}
+
+// Full standalone HTML report for one insight — kept out of getInsights' list
+// query (which only needs has_report) since report_html can be tens of KB.
+export async function getInsightReport(insightId: string): Promise<string | null> {
+  const result = await client.query({
+    query: `
+      SELECT report_html
+      FROM agent_meta.insights
+      WHERE insight_id = {id:String}
+      ORDER BY ts DESC
+      LIMIT 1
+    `,
+    query_params: { id: insightId },
+    format: 'JSONEachRow',
+  });
+  const rows = await result.json<{ report_html: string }>();
+  return rows[0]?.report_html || null;
 }
 
 export async function getContextVersions(limit = 100): Promise<ContextVersion[]> {

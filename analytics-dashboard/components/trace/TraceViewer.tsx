@@ -1,6 +1,6 @@
 'use client';
 import { useState } from 'react';
-import { Brain, Wrench, ShieldCheck, BookMarked, LineChart, Loader2, ChevronRight, ChevronDown } from 'lucide-react';
+import { Brain, Wrench, ShieldCheck, BookMarked, LineChart, Loader2, ChevronRight, ChevronDown, Rocket } from 'lucide-react';
 import type { AgentEvent } from './types';
 import { getEventFamily, cleanToolName, elapsed } from './utils';
 import { SqlWidget } from './widgets/SqlWidget';
@@ -9,13 +9,15 @@ import { SchemaWidget, TablesWidget } from './widgets/SchemaWidget';
 import { ContextLookupWidget, ContextIndexWidget } from './widgets/ContextWidget';
 import { SkillFileWidget, SkillListWidget } from './widgets/SkillWidget';
 import { GenerationWidget } from './widgets/GenerationWidget';
-import { ProposalWidget, ReviewWidget } from './widgets/ProposalReviewWidget';
+import { ProposalWidget, ReviewWidget, InsightWidget, ExecutionWidget, ContextUpdateWidget } from './widgets/ProposalReviewWidget';
 
-// Only thinking (reasoning/generation) and tool calls are shown here — the
-// pipeline's own span/trace/plain-log bookkeeping events are real but not
-// useful to a reader watching the agent work, so they're dropped rather than
-// exposed behind a filter toggle.
-const VISIBLE_KINDS = new Set(['reasoning', 'generation', 'tool_call']);
+// Only thinking (reasoning/generation), tool calls, and the two deterministic
+// pipeline-outcome summaries (execution/context_update -- see
+// tracing/langfuse_wrapper.py's _step_kind docstring for why those used to be
+// invisible) are shown here — the pipeline's own span/trace/plain-log
+// bookkeeping events are real but not useful to a reader watching the agent
+// work, so they're dropped rather than exposed behind a filter toggle.
+const VISIBLE_KINDS = new Set(['reasoning', 'generation', 'tool_call', 'execution', 'context_update']);
 
 // ── Route event to correct widget ─────────────────────────────────────────────
 
@@ -49,6 +51,9 @@ function EventWidget({ event }: { event: AgentEvent }) {
   // "review_generation" (see orchestrator/pipeline.py's _propose/_review).
   if (event.step === 'propose_generation') return <ProposalWidget event={event} />;
   if (event.step === 'review_generation')  return <ReviewWidget event={event} />;
+  if (event.step === 'analytics_generation') return <InsightWidget event={event} />;
+  if (event.step === 'executed')         return <ExecutionWidget event={event} />;
+  if (event.step === 'context_updated')  return <ContextUpdateWidget event={event} />;
 
   const family = getEventFamily(event);
   const clean  = cleanToolName(event.step);
@@ -96,13 +101,21 @@ function EventWidget({ event }: { event: AgentEvent }) {
 type PhaseIcon = React.ComponentType<{ className?: string; style?: React.CSSProperties }>;
 
 const PHASE_META: Record<string, { label: string; icon: PhaseIcon; accent: string }> = {
-  propose:    { label: 'Instrumentation Proposer', icon: Wrench,      accent: '#d97706' },
-  review:     { label: 'Context Reviewer',         icon: ShieldCheck, accent: '#2563eb' },
-  chronicle:  { label: 'Context Chronicler',       icon: BookMarked,  accent: '#7c3aed' },
-  analytics:  { label: 'Analytics Agent',          icon: LineChart,   accent: '#16a34a' },
+  propose:    { label: 'Proposal',        icon: Wrench,      accent: '#d97706' },
+  review:     { label: 'Review',          icon: ShieldCheck, accent: '#2563eb' },
+  executed:   { label: 'Execution',       icon: Rocket,      accent: '#0891b2' },
+  chronicle:  { label: 'Context Update',  icon: BookMarked,  accent: '#7c3aed' },
+  analytics:  { label: 'Analytics Agent', icon: LineChart,   accent: '#16a34a' },
 };
 
 function derivePhaseKey(step: string): string {
+  // The chronicler's OWN reasoning/tool-call turn is step-prefixed
+  // "chronicle_..." (matches naturally below), but the deterministic
+  // "context_updated" summary that follows it -- the sections it actually
+  // wrote -- has a step name that doesn't share that prefix. Force it into
+  // the SAME phase group so it reads as "the chronicler worked, and here's
+  // what it produced", not a disconnected fifth section.
+  if (step === 'context_updated') return 'chronicle';
   return step.match(/^[a-zA-Z]+/)?.[0] ?? 'pipeline';
 }
 

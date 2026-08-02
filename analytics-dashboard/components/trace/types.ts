@@ -1,4 +1,4 @@
-export type EventKind = 'generation' | 'reasoning' | 'tool_call' | 'span_start' | 'span_end' | 'log' | 'trace_start' | 'trace_end';
+export type EventKind = 'generation' | 'reasoning' | 'tool_call' | 'execution' | 'context_update' | 'span_start' | 'span_end' | 'log' | 'trace_start' | 'trace_end';
 
 export type ToolFamily =
   | 'sql_query' | 'schema' | 'tables'
@@ -64,4 +64,19 @@ export interface PythonOutput {
 export interface SkillFileOutput {
   content?: string;
   path?: string;
+}
+
+// orchestrator/pipeline.py's "executed" step output -- what actually landed
+// in ClickHouse (real DDL + row count), not just "it worked".
+export interface ExecutionOutput {
+  base_table?: string;
+  base_table_ddl?: string;
+  rows_inserted?: number;
+  materialized_views?: { name: string; ddl: string }[];
+}
+
+// orchestrator/pipeline.py's "context_updated" step output -- every section
+// the chronicler wrote/updated on this run.
+export interface ContextUpdateOutput {
+  sections?: { section: string; title?: string; is_new?: boolean; diff_summary?: string }[];
 }

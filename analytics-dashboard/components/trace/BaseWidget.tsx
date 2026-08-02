@@ -2,7 +2,8 @@
 import { useState } from 'react';
 import {
   ChevronRight, ChevronDown, Database, FolderTree, BookOpen, Terminal,
-  FileCode, Sparkles, GitBranch, Circle, Wrench, ShieldCheck,
+  FileCode, Sparkles, GitBranch, Circle, Wrench, ShieldCheck, LineChart,
+  Rocket, BookMarked,
 } from 'lucide-react';
 
 export const TOOL_META: Record<string, { icon: React.ComponentType<{ className?: string; style?: React.CSSProperties }>; label: string; accent: string; bg: string }> = {
@@ -18,6 +19,9 @@ export const TOOL_META: Record<string, { icon: React.ComponentType<{ className?:
   generation:     { icon: Sparkles,    label: 'Generation',       accent: '#4f46e5', bg: '#eef2ff' },
   proposal:       { icon: Wrench,      label: 'Proposal',         accent: '#d97706', bg: '#fffbeb' },
   review:         { icon: ShieldCheck, label: 'Review',           accent: '#2563eb', bg: '#eff6ff' },
+  insight:        { icon: LineChart,   label: 'Insight',          accent: '#16a34a', bg: '#f0fdf4' },
+  execution:      { icon: Rocket,      label: 'Execution',        accent: '#0891b2', bg: '#ecfeff' },
+  context_update: { icon: BookMarked,  label: 'Context Update',   accent: '#7c3aed', bg: '#faf5ff' },
   span:           { icon: GitBranch,   label: 'Span',             accent: '#6b7280', bg: '#f9fafb' },
   other:          { icon: Circle,      label: '',                 accent: '#9ca3af', bg: '#f9fafb' },
 };

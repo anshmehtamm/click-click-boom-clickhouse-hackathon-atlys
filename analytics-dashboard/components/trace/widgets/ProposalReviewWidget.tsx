@@ -231,6 +231,193 @@ export function ReviewWidget({ event }: { event: AgentEvent }) {
   );
 }
 
+// ── Insight (analytics agent's final output) ─────────────────────────────────
+// Same "real structure, not a JSON dump" treatment as Proposal/Review, for
+// analytics_agent's output (title/summary/confidence/segment_cuts/
+// related_known_issues/report_html — see analytics/analytics_agent.py).
+// report_html itself is the self-contained report already viewable on the
+// Insights page once persisted — shown here as a length/availability note,
+// not inlined (it can be tens of KB of markup, wrong fit for a trace widget).
+
+export function InsightWidget({ event }: { event: AgentEvent }) {
+  const parsed = parseOutput(event.output);
+  if (!parsed) return <FallbackRaw event={event} family="insight" title="insight" />;
+
+  const {
+    title, summary, confidence, segment_cuts = [], related_known_issues = [], report_html,
+  } = parsed;
+
+  return (
+    <BaseWidget
+      family="insight"
+      title={title || 'insight'}
+      meta={undefined}
+      defaultOpen
+      collapsedPreview={<span className="italic">{truncate(summary ?? '', 60)}</span>}
+    >
+      <div className="p-3.5 space-y-3">
+        <div className="flex items-center gap-2 flex-wrap">
+          <ConfidenceBadge value={confidence} />
+        </div>
+
+        {summary && <Prose label="summary" text={summary} accent="#16a34a" />}
+
+        {segment_cuts.length > 0 && (
+          <div>
+            <span className="text-[9.5px] font-bold uppercase tracking-widest block mb-1" style={{ color: '#9c9088' }}>
+              segment cuts explored
+            </span>
+            <div className="flex flex-wrap gap-1.5">
+              {segment_cuts.map((s: string, i: number) => (
+                <span key={i} className="text-[11px] font-mono px-2 py-0.5 rounded-full"
+                  style={{ color: '#1c1814', backgroundColor: '#f0ece6' }}>
+                  {s}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {related_known_issues.length > 0 && (
+          <div>
+            <span className="text-[9.5px] font-bold uppercase tracking-widest block mb-1" style={{ color: '#9c9088' }}>
+              related known issues ({related_known_issues.length})
+            </span>
+            <div className="space-y-1.5">
+              {related_known_issues.map((ki: any, i: number) => {
+                const parsedKi = typeof ki === 'string' ? (() => { try { return JSON.parse(ki); } catch { return { issue: ki }; } })() : ki;
+                return (
+                  <div key={i} className="rounded-lg border p-2.5 text-[11.5px]" style={{ borderColor: '#e5dfd6', backgroundColor: '#faf8f5' }}>
+                    <span className="font-semibold" style={{ color: '#1c1814' }}>{parsedKi.issue}</span>
+                    {parsedKi.status && (
+                      <span className="ml-2 text-[10px] font-semibold uppercase" style={{ color: '#9c9088' }}>{parsedKi.status}</span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {report_html && (
+          <p className="text-[11px]" style={{ color: '#9c9088' }}>
+            Full HTML report written ({Math.round(String(report_html).length / 1024)} KB) — view it from the Insights list once this run finishes.
+          </p>
+        )}
+      </div>
+    </BaseWidget>
+  );
+}
+
+// ── Execution (what actually landed in ClickHouse) ────────────────────────────
+// orchestrator/pipeline.py's "executed" step -- deterministic Python output,
+// not an LLM turn, but the single most concrete "what happened" moment in
+// the whole run: the real DDL that ran and the real row count that landed.
+
+export function ExecutionWidget({ event }: { event: AgentEvent }) {
+  const parsed = parseOutput(event.output);
+  if (!parsed) return <FallbackRaw event={event} family="execution" title="execution" />;
+
+  const { base_table, base_table_ddl, rows_inserted, materialized_views = [] } = parsed;
+
+  return (
+    <BaseWidget
+      family="execution"
+      title={base_table || 'execution'}
+      meta={rows_inserted != null ? `${rows_inserted.toLocaleString()} rows` : undefined}
+      defaultOpen
+      collapsedPreview={materialized_views.length ? <span className="italic">+{materialized_views.length} MV{materialized_views.length !== 1 ? 's' : ''}</span> : undefined}
+    >
+      <div className="p-3.5 space-y-3">
+        <div className="flex items-center gap-2 flex-wrap">
+          {base_table && (
+            <span className="text-[12px] font-mono font-semibold px-2 py-0.5 rounded" style={{ color: '#1c1814', backgroundColor: '#f0ece6' }}>
+              {base_table}
+            </span>
+          )}
+          {rows_inserted != null && (
+            <span className="text-[11px] font-mono tabular-nums px-1.5 py-0.5 rounded" style={{ color: '#16a34a', backgroundColor: '#16a34a15' }}>
+              {rows_inserted.toLocaleString()} rows inserted
+            </span>
+          )}
+        </div>
+
+        {base_table_ddl && (
+          <div>
+            <span className="text-[9.5px] font-bold uppercase tracking-widest block mb-1" style={{ color: '#9c9088' }}>
+              base table DDL (as executed)
+            </span>
+            <CodeBlock code={base_table_ddl} lang="sql" />
+          </div>
+        )}
+
+        {materialized_views.length > 0 && (
+          <div>
+            <span className="text-[9.5px] font-bold uppercase tracking-widest block mb-1" style={{ color: '#9c9088' }}>
+              materialized views created ({materialized_views.length})
+            </span>
+            <div className="space-y-2">
+              {materialized_views.map((mv: any, i: number) => (
+                <div key={i} className="rounded-lg border p-2.5" style={{ borderColor: '#e5dfd6', backgroundColor: '#faf8f5' }}>
+                  <div className="text-[11.5px] font-mono font-semibold mb-1" style={{ color: '#1c1814' }}>{mv.name}</div>
+                  {mv.ddl && <CodeBlock code={mv.ddl} lang="sql" />}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    </BaseWidget>
+  );
+}
+
+// ── Context Update (chronicler's committed sections) ──────────────────────────
+// orchestrator/pipeline.py's "context_updated" step -- one row per
+// context_versions section actually written this run. Separate from the
+// chronicle_generation event (the chronicler's own reasoning turn) --
+// this is the settled OUTCOME: what the context layer looks like now.
+
+export function ContextUpdateWidget({ event }: { event: AgentEvent }) {
+  const parsed = parseOutput(event.output);
+  if (!parsed) return <FallbackRaw event={event} family="context_update" title="context update" />;
+
+  const { sections = [] } = parsed;
+  const newCount = sections.filter((s: any) => s.is_new).length;
+
+  return (
+    <BaseWidget
+      family="context_update"
+      title={`${sections.length} section${sections.length !== 1 ? 's' : ''} updated`}
+      meta={newCount > 0 ? `${newCount} new` : undefined}
+      defaultOpen
+      collapsedPreview={<span className="italic">{sections.slice(0, 3).map((s: any) => s.section).join(', ')}</span>}
+    >
+      <div className="p-3.5 space-y-1.5">
+        {sections.length === 0 ? (
+          <p className="text-[11.5px]" style={{ color: '#9c9088' }}>No sections updated.</p>
+        ) : sections.map((s: any, i: number) => (
+          <div key={i} className="rounded-lg border p-2.5" style={{ borderColor: '#e5dfd6', backgroundColor: '#faf8f5' }}>
+            <div className="flex items-center gap-2 mb-1">
+              <span className="text-[11px] font-mono font-semibold" style={{ color: '#1c1814' }}>{s.section}</span>
+              <span className="text-[9.5px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded"
+                style={{
+                  color: s.is_new ? '#7c3aed' : '#9c9088',
+                  backgroundColor: s.is_new ? '#7c3aed18' : '#f0ece6',
+                }}>
+                {s.is_new ? 'new' : 'updated'}
+              </span>
+            </div>
+            {s.title && <p className="text-[11.5px]" style={{ color: '#4a4540' }}>{s.title}</p>}
+            {s.diff_summary && (
+              <p className="text-[11px] mt-1" style={{ color: '#7a7068' }}>{s.diff_summary}</p>
+            )}
+          </div>
+        ))}
+      </div>
+    </BaseWidget>
+  );
+}
+
 // Fallback if output somehow doesn't parse as JSON (shouldn't happen — the
 // proposer/reviewer are both strict-json_schema constrained — but never
 // silently show nothing).

@@ -110,13 +110,24 @@ def _step_kind(step: str) -> str:
     cosmetic — matches the naming convention orchestrator/agent_io.py's
     _call_json_agent already uses (`{step}_generation`, `{step}_tool[i]_{name}`,
     `{step}_reasoning[turnN]` — the last logged LIVE per turn during the
-    tool-calling loop, not batched at the end)."""
+    tool-calling loop, not batched at the end).
+
+    "executed"/"context_updated" (orchestrator/pipeline.py's real-DDL-executed
+    and chronicler-sections-written summaries) used to fall through to plain
+    "log" -- which the dashboard's VISIBLE_KINDS filter drops entirely, so
+    what actually got created in ClickHouse and what context sections got
+    written were silently invisible in the trace view. Distinct kinds so the
+    frontend can show them as their own named, structured sections instead."""
     if "_tool[" in step:
         return "tool_call"
     if "_reasoning[" in step:
         return "reasoning"
     if step.endswith("_generation"):
         return "generation"
+    if step == "executed":
+        return "execution"
+    if step == "context_updated":
+        return "context_update"
     return "log"
 
 

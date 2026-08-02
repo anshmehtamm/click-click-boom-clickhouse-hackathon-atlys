@@ -1,10 +1,11 @@
 'use client';
 
 import { useEffect, useRef, useState, useLayoutEffect, useCallback } from 'react';
-import { X, FolderOpen, Play, Loader2, CheckCircle, XCircle, RotateCcw, ExternalLink } from 'lucide-react';
+import { X, FolderOpen, Play, Loader2, CheckCircle, XCircle, RotateCcw, ExternalLink, LineChart } from 'lucide-react';
 import { usePanelCtx } from '@/lib/panel-context';
 import { TraceViewer } from '@/components/trace/TraceViewer';
 import type { AgentEvent } from '@/components/trace/types';
+import type { SpecSummary } from '@/app/api/specs/route';
 
 // ── types ─────────────────────────────────────────────────────────────────────
 
@@ -27,6 +28,11 @@ export interface RunResult {
   trace_url?: string;
   reason?: string;
   error?: string;
+  // analytics-mode fields (run_analytics_for_spec's return shape — see
+  // atlys-agents/analytics/analytics_agent.py)
+  insight_id?: string;
+  title?: string;
+  confidence?: number;
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -141,7 +147,7 @@ function LogRow({ entry }: { entry: LogEntry }) {
 // ── main panel ────────────────────────────────────────────────────────────────
 
 export function AgentPanel() {
-  const { close, mode: panelMode, historySpec } = usePanelCtx();
+  const { close, mode: panelMode, historySpec, analyticsSpec } = usePanelCtx();
 
   // ── history mode: the real persisted trace (agent_meta.trace_events) for
   // how this spec was most recently ingested, same events/widgets as a live
@@ -256,19 +262,20 @@ export function AgentPanel() {
   const addLog = (stage: string, message: string) =>
     setLogs(prev => [...prev, { id: crypto.randomUUID(), stage, message, ts: Date.now() }]);
 
-  // Reattach to an in-progress (or just-finished) ingestion on mount --
-  // /api/ingest's SSE stream is tied to the browser request that started it,
-  // so a page reload loses it entirely otherwise (see lib/live-run-store.ts).
-  // Only relevant in 'new' mode -- history mode already fetches its own data.
+  // Reattach to an in-progress (or just-finished) run on mount -- /api/ingest
+  // and /api/analytics's SSE streams are both tied to the browser request
+  // that started them, so a page reload loses it entirely otherwise (see
+  // lib/live-run-store.ts, shared by both). Relevant in 'new' AND 'analytics'
+  // mode -- history mode already fetches its own data.
   useEffect(() => {
-    if (panelMode !== 'new') return;
+    if (panelMode !== 'new' && panelMode !== 'analytics') return;
     let pollTimer: ReturnType<typeof setInterval> | null = null;
 
     // Only reconnect into 'running' -- a leftover FINISHED snapshot from
-    // whatever ran last must never hijack a fresh "New Spec" panel into
-    // showing a stale result (the store keeps the last result around only so
-    // a reload during the trailing "Done" screen doesn't lose it, not so the
-    // NEXT unrelated panel open inherits it).
+    // whatever ran last must never hijack a fresh panel open into showing a
+    // stale result (the store keeps the last result around only so a reload
+    // during the trailing "Done" screen doesn't lose it, not so the NEXT
+    // unrelated panel open inherits it).
     const applySnapshot = (data: { specName: string | null; active: boolean; events: any[]; result: any }): boolean => {
       if (!data.active || !data.specName) return false;
       setSpecName(data.specName);
@@ -289,11 +296,34 @@ export function AgentPanel() {
             }
           }).catch(() => {});
         }, 1500);
+      } else if (panelMode === 'analytics') {
+        // Nothing currently running -- initialize into the spec picker, or
+        // straight to the confirm step if opened pre-targeted at one spec.
+        setResult(null); setTraceEvents([]); setLogs([]);
+        if (analyticsSpec) { setSpecName(analyticsSpec); setMode('folder-selected'); }
+        else { setSpecName(''); setMode('idle'); }
       }
     }).catch(() => {});
 
     return () => { if (pollTimer) clearInterval(pollTimer); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [panelMode, analyticsSpec]);
+
+  // Analytics mode's spec picker: only specs whose latest proposal actually
+  // reached 'executed' are eligible (same gate analytics_agent.py's
+  // run_analytics_for_spec enforces server-side -- this is just the UI's
+  // early filter so an ineligible spec never even shows up to click).
+  const [eligibleSpecs, setEligibleSpecs] = useState<SpecSummary[]>([]);
+  const [eligibleLoading, setEligibleLoading] = useState(false);
+
+  useEffect(() => {
+    if (panelMode !== 'analytics') return;
+    setEligibleLoading(true);
+    fetch('/api/specs')
+      .then(r => r.json())
+      .then(d => setEligibleSpecs(Array.isArray(d) ? d.filter((s: SpecSummary) => s.latest_status === 'executed') : []))
+      .catch(() => setEligibleSpecs([]))
+      .finally(() => setEligibleLoading(false));
   }, [panelMode]);
 
   // /api/ingest's stderr handler forwards EVERY line from the Python
@@ -327,6 +357,37 @@ export function AgentPanel() {
   };
 
   // ── run ─────────────────────────────────────────────────────────────────────
+  // Shared SSE consumption for BOTH /api/ingest and /api/analytics -- both
+  // routes emit the identical trace_event/log/complete/error wire shape (see
+  // app/api/analytics/route.ts's docstring), so only the request that kicks
+  // each one off differs.
+  const consumeSSEStream = async (res: Response) => {
+    const reader = res.body!.getReader();
+    const dec    = new TextDecoder();
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      for (const line of dec.decode(value).split('\n\n')) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const data = JSON.parse(line.slice(6));
+          if (data.type === 'trace_event') {
+            setTraceEvents(prev => [...prev, normalizeTraceEvent(data)]);
+          } else if (data.type === 'log') {
+            addLog(data.stage ?? 'info', data.message);
+          } else if (data.type === 'complete') {
+            setResult(data.result);
+            setMode('done');
+          } else if (data.type === 'error') {
+            addLog('error', data.message);
+            setResult({ status: 'failed', error: data.message });
+            setMode('done');
+          }
+        } catch { /* bad json */ }
+      }
+    }
+  };
 
   const handleRun = async () => {
     if (!specFile || !eventsFile) return;
@@ -344,31 +405,7 @@ export function AgentPanel() {
     try {
       const res = await fetch('/api/ingest', { method: 'POST', body: formData });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const reader = res.body!.getReader();
-      const dec    = new TextDecoder();
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        for (const line of dec.decode(value).split('\n\n')) {
-          if (!line.startsWith('data: ')) continue;
-          try {
-            const data = JSON.parse(line.slice(6));
-            if (data.type === 'trace_event') {
-              setTraceEvents(prev => [...prev, normalizeTraceEvent(data)]);
-            } else if (data.type === 'log') {
-              addLog(data.stage ?? 'info', data.message);
-            } else if (data.type === 'complete') {
-              setResult(data.result);
-              setMode('done');
-            } else if (data.type === 'error') {
-              addLog('error', data.message);
-              setResult({ status: 'failed', error: data.message });
-              setMode('done');
-            }
-          } catch { /* bad json */ }
-        }
-      }
+      await consumeSSEStream(res);
     } catch (err) {
       addLog('error', String(err));
       setResult({ status: 'failed', error: String(err) });
@@ -376,31 +413,60 @@ export function AgentPanel() {
     }
   };
 
-  // On success, tell the specs list to refetch (it's the same panel that now
-  // opens on a spec click, so there's no longer a dedicated page to navigate
-  // to — just close and let the list pick up the new/updated row).
-  useEffect(() => {
-    if (mode === 'done' && result?.status === 'executed' && specName) {
-      const t = setTimeout(() => {
-        window.dispatchEvent(new Event('specs-updated'));
-        close();
-      }, 1800);
-      return () => clearTimeout(t);
-    }
-  }, [mode, result, specName, close]);
-
-  const reset = () => {
-    setMode('idle');
+  const handleRunAnalytics = async () => {
+    if (!specName) return;
+    setMode('running');
     setLogs([]);
     setTraceEvents([]);
     setResult(null);
-    setSpecName('');
+
+    try {
+      const res = await fetch('/api/analytics', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ specName }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      await consumeSSEStream(res);
+    } catch (err) {
+      addLog('error', String(err));
+      setResult({ status: 'failed', error: String(err) });
+      setMode('done');
+    }
+  };
+
+  // Tell the specs/insights list to refetch on ANY completion, not just
+  // success -- this used to fire only on a successful outcome, so a run that
+  // failed/timed out (a real, common outcome: needs_rework after exhausting
+  // MAX_REVISIONS, or the 4-minute kill) never refreshed the list at all. The
+  // row was always there in ClickHouse (durable regardless of this refetch
+  // trigger) -- an already-open list page just kept showing its stale
+  // pre-run snapshot until a manual reload. Auto-close/navigate-away stays
+  // success-only: a failure should stay on screen so the error is actually
+  // readable, not vanish after 1.8s. Analytics mode never auto-closes even on
+  // success -- the insight report link in the DONE screen is the point of
+  // staying open (see the DONE block below).
+  useEffect(() => {
+    if (mode !== 'done' || !specName) return;
+    window.dispatchEvent(new Event(panelMode === 'analytics' ? 'insights-updated' : 'specs-updated'));
+    if (panelMode === 'new' && result?.status === 'executed') {
+      const t = setTimeout(() => close(), 1800);
+      return () => clearTimeout(t);
+    }
+  }, [mode, result, specName, panelMode, close]);
+
+  const reset = () => {
+    setMode(panelMode === 'analytics' ? (analyticsSpec ? 'folder-selected' : 'idle') : 'idle');
+    setLogs([]);
+    setTraceEvents([]);
+    setResult(null);
+    if (panelMode !== 'analytics') setSpecName('');
     setSpecFile(null);
     setEventsFile(null);
     if (folderRef.current) folderRef.current.value = '';
   };
 
-  const success = result?.status === 'executed';
+  const success = panelMode === 'analytics' ? result?.status === 'completed' : result?.status === 'executed';
 
   // Whichever event set is currently on screen (live ingest or history) —
   // every event on a trace shares the same trace_url, so the first one found

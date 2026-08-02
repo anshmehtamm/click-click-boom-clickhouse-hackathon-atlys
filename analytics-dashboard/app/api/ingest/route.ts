@@ -4,7 +4,7 @@ import path from 'path';
 import fs from 'fs';
 import { startRun, pushRawEvent, finishRun, getSnapshot } from '@/lib/live-run-store';
 
-export const maxDuration = 300; // 5 minutes for long-running ingestion
+export const maxDuration = 1200; // 20 minutes -- matches the internal TIMEOUT_MS below
 
 export async function POST(request: NextRequest) {
   try {
@@ -216,14 +216,24 @@ except Exception as e:
           controller.close();
         });
 
-        // Timeout after 4 minutes
+        // 4 minutes was set back when MAX_REVISIONS was 4 and the pipeline
+        // was simpler -- with MAX_REVISIONS=6 and each revision running a
+        // real multi-turn tool-calling propose AND review loop (10-20+ tool
+        // calls each, reasoning.effort="medium"), a genuinely legitimate run
+        // can take well over 4 minutes. That killed real in-progress work
+        // outright, with nothing durable written yet for the killed attempt
+        // (schema_proposals only gets a row once a revision's propose/review
+        // cycle actually completes) -- it just vanished, no trace anywhere.
+        // 20 minutes is a generous ceiling for a hackathon-scale run while
+        // still bounding a genuinely stuck process.
+        const TIMEOUT_MS = 20 * 60 * 1000;
         setTimeout(() => {
           python.kill();
-          const result = { status: 'failed', error: 'Pipeline timeout after 4 minutes' };
+          const result = { status: 'failed', error: `Pipeline timeout after ${TIMEOUT_MS / 60000} minutes` };
           sendEvent({ type: 'error', message: result.error });
           finishRun(result);
           controller.close();
-        }, 240000);
+        }, TIMEOUT_MS);
       }
     });
 

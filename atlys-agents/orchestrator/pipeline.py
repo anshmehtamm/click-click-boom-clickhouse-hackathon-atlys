@@ -154,6 +154,80 @@ def _update_proposal_status(client, proposal_id: str, **fields):
     client.insert("schema_proposals", [[row[c] for c in cols]], column_names=cols)
 
 
+_CREATE_OBJECT_RE = re.compile(
+    r"CREATE\s+(?:TABLE|MATERIALIZED\s+VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z0-9_.]+)",
+    re.IGNORECASE,
+)
+
+
+def _mv_object_names(mv: dict) -> list[str]:
+    """Every real table/view name a materialized view's own DDL creates --
+    `mv['name']` alone misses a `TO <backing_table>` target's backing table,
+    which is its OWN separate `CREATE TABLE` statement inside `mv['ddl']`
+    (see pipeline.py's execute step: "Some MVs are 2 statements: a backing
+    table ... plus the CREATE MATERIALIZED VIEW itself"). Parses the DDL
+    directly rather than trusting `name` alone, so cleanup (here and the
+    execute-error handler) actually removes everything a real MV created,
+    not just the view object -- confirmed missing the backing table on a
+    real TO-target MV before this fix."""
+    names = {n.split(".")[-1] for n in _CREATE_OBJECT_RE.findall(mv.get("ddl", ""))}
+    if mv.get("name"):
+        names.add(mv["name"])
+    return sorted(names)
+
+
+def _drop_mv_objects(data_client, mv: dict) -> list[str]:
+    """DROP TABLE and DROP VIEW are both harmless no-ops (IF EXISTS) against
+    whichever kind an object actually isn't -- cheaper than tracking which
+    of a backing table vs. the view itself each name refers to."""
+    names = _mv_object_names(mv)
+    for name in names:
+        data_client.command(f"DROP TABLE IF EXISTS atlys.{name}")
+        data_client.command(f"DROP VIEW IF EXISTS atlys.{name}")
+    return names
+
+
+def _cleanup_previous_execution(meta_client, data_client, run, spec_name: str) -> None:
+    """Drops whatever a PRIOR successful ingest_spec() run for this exact
+    spec_name left behind in atlys, before this run does any new work.
+
+    Without this, re-ingesting the same spec was actively destructive: the
+    base table DDL is `CREATE TABLE <name> (...)` with no IF NOT EXISTS, so
+    if the new proposal reuses the same table_name (likely -- it's derived
+    from the same spec), CREATE fails with "table already exists". That
+    failure was only ever handled as a generic execute-error: the except
+    block's cleanup unconditionally does `DROP TABLE IF EXISTS
+    atlys.<table_name>` for its OWN failed attempt, which in this case is
+    actually the PREVIOUS run's real table -- dropped with nothing
+    re-created in its place if the revision budget was already exhausted.
+    Real data loss as a side effect of error handling, not a deliberate
+    "replace old data" step.
+
+    Looks at every row this spec_name has ever reached status='executed'
+    with, not just the latest, so an earlier run that used a DIFFERENT
+    table_name doesn't leave an orphaned table sitting in atlys forever."""
+    rows = meta_client.query(
+        "SELECT DISTINCT table_name, materialized_views FROM schema_proposals "
+        "WHERE spec_name = %(spec)s AND status = 'executed'",
+        parameters={"spec": spec_name},
+    ).result_rows
+    if not rows:
+        return
+    dropped = []
+    for table_name, mv_json_list in rows:
+        if table_name:
+            data_client.command(f"DROP TABLE IF EXISTS atlys.{table_name}")
+            dropped.append(table_name)
+        for mv_raw in mv_json_list:
+            try:
+                mv = json.loads(mv_raw) if isinstance(mv_raw, str) else mv_raw
+            except json.JSONDecodeError:
+                continue
+            dropped.extend(_drop_mv_objects(data_client, mv or {}))
+    if dropped:
+        run.log(step="cleanup_previous_execution", input={"spec_name": spec_name}, output={"dropped": dropped})
+
+
 def _write_review(client, proposal_id: str, revision: int, review: dict, sections_used: list[str], trace_url: str) -> str:
     review_id = str(uuid.uuid4())
     client.insert(
@@ -334,7 +408,20 @@ def ingest_spec(
     full_events = full_events if full_events is not None else sample_events
     sample_scratch_info = _write_sample_scratch_file(sample_events)
 
+    # Durably store spec_markdown so a LATER, separate step (the dashboard's
+    # explicit "Create Insight" trigger -- see analytics_agent.run_analytics_for_spec)
+    # can look it up without needing the original in-memory call or local file.
+    meta_client.insert(
+        "spec_sources", [[spec_name, spec_markdown]], column_names=["spec_name", "spec_markdown"],
+    )
+
     with traced_run(agent="pipeline", spec=spec_name) as run:
+        # Clean re-ingest, not an accidental one: drop whatever a PRIOR
+        # successful run of this exact spec left in atlys BEFORE any new
+        # propose/review work starts -- see _cleanup_previous_execution's
+        # docstring for why this used to be actively destructive instead.
+        _cleanup_previous_execution(meta_client, get_client(database="atlys"), run, spec_name)
+
         revision = 0
         prior_findings = None
         previous_draft = None
@@ -782,9 +869,11 @@ def ingest_spec(
                 run.log(step="execute_error", input={"failed_object": failed_label, "statement": failed_stmt}, output=str(e))
                 data_client.command(f"DROP TABLE IF EXISTS atlys.{final_proposal['table_name']}")
                 for mv in final_proposal.get("materialized_views", []):
-                    if mv.get("name"):
-                        data_client.command(f"DROP TABLE IF EXISTS atlys.{mv['name']}")
-                        data_client.command(f"DROP VIEW IF EXISTS atlys.{mv['name']}")
+                    # _drop_mv_objects parses the DDL for every real object it
+                    # creates, not just mv['name'] -- a `TO <backing_table>`
+                    # target's backing table is its own separate CREATE TABLE
+                    # statement that mv['name'] alone never named.
+                    _drop_mv_objects(data_client, mv)
                 if at_cap:
                     _update_proposal_status(meta_client, proposal_id, status="rejected")
                     return {"status": "rejected", "reason": "execute_failed", "proposal_id": proposal_id, "trace_url": run.url, "error": str(e)}

@@ -5,25 +5,31 @@ import { Plus } from 'lucide-react';
 import { openAgentPanel, openSpecHistory } from '@/lib/panel-context';
 import type { SpecSummary } from '../api/specs/route';
 
-// Only two states matter to a reader scanning this list: is it still going,
-// or is it done. schema_proposals' real status enum (drafted/pending_review/
-// needs_rework/approved/executed/rejected) is per-revision pipeline
-// bookkeeping -- genuinely useful inside a run's own trace, but NOT what
-// "is this still running" means: it's a snapshot of the last-written
-// revision's stage, which stays frozen at whatever it was when the process
-// stopped -- including a run that hit MAX_REVISIONS and gave up, or crashed,
-// which is finished but never reached "executed". Showing "Running" for any
-// non-executed status made every one of those look stuck in progress
-// forever, even hours after they'd actually ended. "Running" now means
-// exactly one thing: this spec is the one live-run-store currently has
-// active (see lib/live-run-store.ts) -- real-time truth, not a status enum.
-function StatusDot({ isLive }: { isLive: boolean }) {
-  const color = isLive ? '#2563eb' : '#16a34a';
+// "Running" is real-time truth, not a status enum -- exactly one thing: this
+// spec is the one live-run-store currently has active (see
+// lib/live-run-store.ts). Once NOT live, though, schema_proposals'
+// latest_status still tells a real, settled story worth surfacing:
+// 'executed' actually landed a table; anything else (needs_rework/rejected/
+// stuck mid-approval) means the run finished without ever landing one --
+// whether because it hit MAX_REVISIONS and gave up (see
+// orchestrator/pipeline.py's at_cap + test_harness_failed path) or was
+// rejected outright. Collapsing that into a generic "Completed" reads as
+// success when it wasn't one.
+function StatusDot({ isLive, latestStatus }: { isLive: boolean; latestStatus: string }) {
+  if (isLive) {
+    return (
+      <span className="flex items-center gap-1.5 min-w-0">
+        <span className="h-1.5 w-1.5 flex-shrink-0 rounded-full" style={{ backgroundColor: '#2563eb' }} />
+        <span className="text-[11px] font-medium truncate" style={{ color: '#4a4540' }}>Running</span>
+      </span>
+    );
+  }
+  const executed = latestStatus === 'executed';
   return (
     <span className="flex items-center gap-1.5 min-w-0">
-      <span className="h-1.5 w-1.5 flex-shrink-0 rounded-full" style={{ backgroundColor: color }} />
+      <span className="h-1.5 w-1.5 flex-shrink-0 rounded-full" style={{ backgroundColor: executed ? '#16a34a' : '#dc2626' }} />
       <span className="text-[11px] font-medium truncate" style={{ color: '#4a4540' }}>
-        {isLive ? 'Running' : 'Completed'}
+        {executed ? 'Completed' : 'Failed'}
       </span>
     </span>
   );
@@ -63,7 +69,7 @@ function SpecRow({ spec, isLive }: { spec: SpecSummary; isLive: boolean }) {
       className="w-full grid items-center gap-4 px-4 py-2.5 text-left transition-colors hover:bg-stone-50 border-b last:border-0"
       style={{ gridTemplateColumns: GRID_COLS, borderColor: '#f0ece6' }}
     >
-      <StatusDot isLive={isLive} />
+      <StatusDot isLive={isLive} latestStatus={spec.latest_status} />
 
       <span className="text-[13px] font-semibold font-mono truncate" style={{ color: '#1c1814' }}>
         {spec.spec_name}

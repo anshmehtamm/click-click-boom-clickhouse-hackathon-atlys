@@ -212,6 +212,15 @@ export function TraceViewer({ events, className, active }: TraceViewerProps) {
 
   const groups = groupByPhase(visible);
 
+  // Open the LAST occurrence of every phase (latest propose, latest review,
+  // approved/executed/context_update/analytics), not just the single last
+  // group in the array. A rework loop can produce many propose/review
+  // cycles -- with only the very last group auto-open, a run that ends on
+  // e.g. "approved" hid its own proposal/review content behind several
+  // collapsed earlier sections with no visual hint they held anything.
+  const lastOccurrenceByKey: Record<string, number> = {};
+  for (const g of groups) lastOccurrenceByKey[g.key] = g.occurrence;
+
   return (
     <div className={className}>
       {groups.map((group, i) => (
@@ -219,7 +228,7 @@ export function TraceViewer({ events, className, active }: TraceViewerProps) {
           key={`${group.key}-${group.occurrence}`}
           group={group}
           isLive={!!active && i === groups.length - 1}
-          defaultOpen={i === groups.length - 1}
+          defaultOpen={group.occurrence === lastOccurrenceByKey[group.key]}
         />
       ))}
     </div>

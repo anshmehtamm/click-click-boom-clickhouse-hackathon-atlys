@@ -2,26 +2,42 @@
 
 export interface Insight {
   insight_id: string;
-  spec_id: string;
-  agent_run_id: string;
-  question: string;
-  answer_text: string;
-  confidence_score: number; // 0.0 - 1.0
-  supporting_evidence: string; // JSON array of evidence objects
-  contradicting_signals: string; // JSON array
+  spec_name: string; // '' for a custom/broad-prompt investigation — see `prompt` below
+  title: string;
+  summary: string;
+  confidence: number; // 0.0 - 1.0
+  evidence: string; // JSON string, currently just {confidence_drivers}
+  related_known_issues: string[];
+  segment_cuts: string[];
+  has_report: boolean; // report_html is non-empty — fetch /api/insights/[id]/report to view
+  created_at: string;
+  trace_url: string | null;
+  prompt: string; // the user's free-text question, non-empty only when spec_name === ''
+}
+
+// Matches agent_meta.context_versions (see atlys-agents/sql/agent_meta_ddl.sql)
+// -- append-only diff log, one row per chronicle/seed write.
+export interface ContextVersion {
+  version_id: string;
+  section: string;
+  before: string;       // '' when this write is a pure addition, not a correction
+  after: string;         // JSON: {title, summary, body, fields, sources}
+  diff_summary: string;
+  rationale: string;
+  trigger: 'seed' | 'seed_correction' | 'chronicle' | string;
+  confidence: number;
   created_at: string;
   trace_url: string | null;
 }
 
-export interface ContextVersion {
-  version_id: string;
-  section_key: string;
-  old_content: string | null;
-  new_content: string;
-  change_reason: string;
-  changed_by_agent: string;
-  created_at: string;
+// Matches agent_meta.current_context (a VIEW over context_versions,
+// argMax'd per section -- see atlys-agents/mcp_servers/context_server.py).
+export interface ContextSection {
+  section: string;       // e.g. "table:document_uploaded", "issue:K1"
+  content: string;       // JSON: {title, summary, body, fields, sources}
+  confidence: number;
   trace_url: string | null;
+  last_updated: string;
 }
 
 export interface SchemaProposal {

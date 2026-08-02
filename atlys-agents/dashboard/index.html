@@ -83,6 +83,7 @@
   .row .usage { font-family: var(--mono); font-size: 10.5px; color: var(--text-dim); padding-top: 3px; white-space: nowrap; }
 
   .kind-generation .step { color: var(--violet); }
+  .kind-reasoning .step { color: var(--violet); }
   .kind-tool_call .step { color: var(--amber); }
   .kind-span .step { color: var(--text-dim); font-style: italic; }
   .kind-trace .step { color: var(--accent); font-weight: 600; }
@@ -167,7 +168,7 @@
 </div>
 
 <script>
-const ICONS = { trace: "◆", span: "›", generation: "✦", tool_call: "⚙", log: "·" };
+const ICONS = { trace: "◆", span: "›", generation: "✦", reasoning: "💭", tool_call: "⚙", log: "·" };
 
 // The whole spec ingestion is ONE Langfuse trace by design (coherent single trace
 // beats 4 disconnected ones) -- but that means "which of the 4 real LLM agents is
@@ -295,13 +296,21 @@ function renderRow(ev, idx) {
   const icon = ICONS[ev.kind] || "·";
   const usage = ev.usage ? `${ev.usage.total ?? ""} tok` : "";
   const [badgeLabel, badgeClass] = agentBadge(ev.step || "");
-  // Thinking callout: only on generation rows (the agent's own stated rationale,
-  // extracted from its structured JSON output by orchestrator/pipeline.py) --
-  // always visible, not hidden behind expand, since this is the actual "thinking"
-  // signal being asked for.
-  const thinkingHtml = (ev.kind === "generation" && ev.reasoning)
-    ? `<div class="thinking"><span class="label">💭 agent's stated reasoning</span>${truncate(ev.reasoning, 600)}</div>`
-    : "";
+  // Thinking callout, two sources, both real:
+  // - kind="generation": the agent's own stated rationale, extracted from its
+  //   final structured JSON output (orchestrator/agent_io.py's reasoning_fn).
+  // - kind="reasoning": the model's REAL reasoning-model output, logged LIVE per
+  //   turn as it happens during the tool-calling loop (agent_runner.runner's
+  //   on_event callback) -- not batched until the whole loop finishes, which
+  //   used to mean 10-20 tool calls with zero intermediate signal.
+  // Always visible, not hidden behind expand, since this is the actual
+  // "thinking" signal being asked for.
+  let thinkingHtml = "";
+  if (ev.kind === "generation" && ev.reasoning) {
+    thinkingHtml = `<div class="thinking"><span class="label">💭 agent's stated reasoning</span>${truncate(ev.reasoning, 600)}</div>`;
+  } else if (ev.kind === "reasoning" && ev.output) {
+    thinkingHtml = `<div class="thinking"><span class="label">💭 live reasoning (this turn)</span>${truncate(ev.output, 600)}</div>`;
+  }
   row.innerHTML = `
     <div class="t">${fmtTime(ev.ts)}</div>
     <div class="icon">${icon}</div>
@@ -323,13 +332,21 @@ function renderRow(ev, idx) {
         `empty. Where an agent has more than one skill attached, "or" means which specific one loaded isn't ` +
         `determinable from this API, not that both loaded.)`
       : "";
-    parts.push(
-      `<span class="k">tool</span>\n${tool.name}  (type: ${tool.label}, call #${tool.index} in this agent turn)${skillLine}\n\n` +
-      `<span class="no-output">Arguments and output are not shown — LibreChat's Agents API (beta) never returns ` +
-      `function_call arguments or a function_call_output item for any tool call (confirmed empirically across ` +
-      `non-streaming, streaming, and streaming-with-reasoning-param requests). The tool name and call order above ` +
-      `are real; the payload isn't recoverable from this API today. This is a beta API gap, not a bug in this pipeline.</span>`
-    );
+    const hasRealArgs = ev.input != null && ev.input !== "";
+    const hasRealOutput = ev.output != null && ev.output !== "";
+    let toolBody = `<span class="k">tool</span>\n${tool.name}  (type: ${tool.label}, call #${tool.index} in this agent turn)${skillLine}`;
+    if (hasRealArgs || hasRealOutput) {
+      // agent_runner.run_agent (direct OpenAI, not LibreChat's proxy) -- real
+      // arguments/output, captured for real this time.
+      if (hasRealArgs) toolBody += `\n\n<span class="k">arguments</span>\n${truncate(ev.input, 3000)}`;
+      if (hasRealOutput) toolBody += `\n\n<span class="k">output</span>\n${truncate(ev.output, 6000)}`;
+    } else {
+      toolBody += `\n\n<span class="no-output">Arguments and output are empty — if this run went through ` +
+        `LibreChat's Agents API (beta), that proxy never returns function_call arguments or output for any tool ` +
+        `call (confirmed empirically). If this run used agent_runner.run_agent instead (direct OpenAI), this ` +
+        `specific call genuinely had no arguments/output (e.g. a no-arg tool).</span>`;
+    }
+    parts.push(toolBody);
   } else {
     if (ev.reasoning) parts.push(`<span class="k">reasoning (full)</span>\n${truncate(ev.reasoning, 4000)}`);
     if (ev.input != null) parts.push(`<span class="k">input</span>\n${truncate(ev.input)}`);

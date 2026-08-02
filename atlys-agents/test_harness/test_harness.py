@@ -125,11 +125,16 @@ def run_new_table_tests(
     scratch_table = f"{scratch_db}.{table_name}__testharness__{uuid.uuid4().hex[:6]}"
     results: list[TestResult] = []
 
+    # partition_key may be "" (orchestrator/pipeline.py normalizes an empty/prose
+    # partition_key to "" rather than a real expression) -- a bare "PARTITION BY "
+    # with nothing after it makes ClickHouse read the next token (the literal
+    # word ORDER) as the partition expression and choke on the BY that follows.
+    partition_clause = f"PARTITION BY {partition_key} " if partition_key else ""
     try:
         client.command(f"DROP TABLE IF EXISTS {scratch_table}")
         client.command(
             f"CREATE TABLE {scratch_table} ({columns_ddl}) "
-            f"ENGINE = MergeTree PARTITION BY {partition_key} ORDER BY {ordering_key} "
+            f"ENGINE = MergeTree {partition_clause}ORDER BY {ordering_key} "
             f"SETTINGS allow_nullable_key = 1"
         )
 

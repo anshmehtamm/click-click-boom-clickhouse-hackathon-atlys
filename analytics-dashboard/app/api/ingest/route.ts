@@ -2,8 +2,9 @@ import { NextRequest } from 'next/server';
 import { spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs';
+import { startRun, setPid, pushRawEvent, finishRun } from '@/lib/live-run-store';
 
-export const maxDuration = 300; // 5 minutes for long-running ingestion
+export const maxDuration = 1200; // 20 minutes -- matches the internal TIMEOUT_MS below
 
 export async function POST(request: NextRequest) {
   try {
@@ -14,10 +15,10 @@ export async function POST(request: NextRequest) {
 
     if (!specName || !specMarkdown || !eventsFile) {
       const encoder = new TextEncoder();
-      return new Response(encoder.encode(JSON.stringify({
+      return new Response(encoder.encode(`data: ${JSON.stringify({
         type: 'error',
         message: 'Missing required fields'
-      })), {
+      })}\n\n`), {
         headers: { 'Content-Type': 'text/event-stream' }
       });
     }
@@ -46,22 +47,44 @@ export async function POST(request: NextRequest) {
 
     if (events.length === 0) {
       const encoder = new TextEncoder();
-      return new Response(encoder.encode(JSON.stringify({
+      return new Response(encoder.encode(`data: ${JSON.stringify({
         type: 'error',
         message: 'No events found in the uploaded file'
-      })), {
+      })}\n\n`), {
         headers: { 'Content-Type': 'text/event-stream' }
       });
     }
+
+    // Runs are tracked by runId now, not a single global slot -- generated
+    // before the stream starts so it can go on the Response's headers
+    // immediately (the client needs it to poll /api/live-run?runId=... after
+    // a reload, see components/agent-panel.tsx).
+    const runId = startRun(specName, 'ingest');
 
     // Create readable stream for Server-Sent Events
     const stream = new ReadableStream({
       async start(controller) {
         const encoder = new TextEncoder();
 
+        // The browser that started this request can disconnect at any point
+        // (panel closed, tab navigated away, network blip) WITHOUT the
+        // spawned python subprocess stopping -- it's an independent OS
+        // process that keeps running against ClickHouse/Langfuse regardless
+        // (that's the whole point of live-run-store: reconnect from any
+        // browser later). Once the underlying connection is gone,
+        // controller.enqueue() throws ("Controller is already closed" /
+        // similar) -- previously that throw was UNCAUGHT inside the
+        // 'data'/'close' handlers below, which aborted the rest of that
+        // callback and meant pushRawEvent/finishRun for every event AFTER
+        // the disconnect never ran. sendEvent must never be able to take
+        // down its caller.
         const sendEvent = (data: any) => {
-          const message = `data: ${JSON.stringify(data)}\n\n`;
-          controller.enqueue(encoder.encode(message));
+          try {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+          } catch { /* this browser is gone -- live-run-store below is still recorded correctly */ }
+        };
+        const safeClose = () => {
+          try { controller.close(); } catch { /* already closed */ }
         };
 
         // Write events + spec to temp JSON files — avoids JSON→Python literal mismatch
@@ -140,8 +163,19 @@ except Exception as e:
             ...agentsEnv,
             PYTHONPATH: agentsDir,
             PYTHONUNBUFFERED: '1',
+            // dashboard/emitter.py: when set, every run.log()/span() event also
+            // prints as one JSON line (type: "trace_event") on stdout, in
+            // addition to its normal POST to the standalone 8787 dashboard.
+            // The stdout handler below already forwards any non-"result" JSON
+            // line straight through this SSE stream -- no extra parsing needed.
+            EMIT_TRACE_EVENTS_STDOUT: '1',
           },
         });
+        // Recorded so a stuck `active: true` can self-heal by checking
+        // whether this pid is still alive, regardless of how tracking went
+        // stale (dev server restart, this process getting killed, etc.) --
+        // see lib/live-run-store.ts's heal().
+        if (python.pid) setPid(runId, python.pid);
 
         let finalResult: any = null;
 
@@ -153,6 +187,11 @@ except Exception as e:
               if (parsed.type === 'result') {
                 finalResult = parsed.data;
               } else {
+                // Record to live-run-store BEFORE trying to notify this
+                // browser -- pushRawEvent must never be skipped just because
+                // sendEvent's connection happens to be dead (see sendEvent's
+                // comment above).
+                if (parsed.type === 'trace_event') pushRawEvent(runId, parsed);
                 sendEvent(parsed);
               }
             } catch (e) {
@@ -186,23 +225,33 @@ except Exception as e:
             try { fs.unlinkSync(f); } catch { /* ignore */ }
           }
 
-          if (finalResult) {
-            sendEvent({ type: 'complete', result: finalResult });
-          } else {
-            sendEvent({
-              type: 'complete',
-              result: { status: 'failed', error: `Process exited with code ${code} — check run log above` }
-            });
-          }
-          controller.close();
+          const result = finalResult ?? { status: 'failed', error: `Process exited with code ${code} — check run log above` };
+          // finishRun FIRST, unconditionally -- this is the durable record
+          // any browser reconnects to via /api/live-run. Notifying THIS
+          // particular connection (sendEvent/close) is best-effort on top.
+          finishRun(runId, result);
+          sendEvent({ type: 'complete', result });
+          safeClose();
         });
 
-        // Timeout after 4 minutes
+        // 4 minutes was set back when MAX_REVISIONS was 4 and the pipeline
+        // was simpler -- with MAX_REVISIONS=6 and each revision running a
+        // real multi-turn tool-calling propose AND review loop (10-20+ tool
+        // calls each, reasoning.effort="medium"), a genuinely legitimate run
+        // can take well over 4 minutes. That killed real in-progress work
+        // outright, with nothing durable written yet for the killed attempt
+        // (schema_proposals only gets a row once a revision's propose/review
+        // cycle actually completes) -- it just vanished, no trace anywhere.
+        // 20 minutes is a generous ceiling for a hackathon-scale run while
+        // still bounding a genuinely stuck process.
+        const TIMEOUT_MS = 20 * 60 * 1000;
         setTimeout(() => {
           python.kill();
-          sendEvent({ type: 'error', message: 'Pipeline timeout after 4 minutes' });
-          controller.close();
-        }, 240000);
+          const result = { status: 'failed', error: `Pipeline timeout after ${TIMEOUT_MS / 60000} minutes` };
+          finishRun(runId, result);
+          sendEvent({ type: 'error', message: result.error });
+          safeClose();
+        }, TIMEOUT_MS);
       }
     });
 
@@ -211,15 +260,16 @@ except Exception as e:
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive',
+        'X-Run-Id': runId,
       },
     });
   } catch (error) {
     console.error('Ingestion error:', error);
     const encoder = new TextEncoder();
-    return new Response(encoder.encode(JSON.stringify({
+    return new Response(encoder.encode(`data: ${JSON.stringify({
       type: 'error',
       message: error instanceof Error ? error.message : 'Failed to run ingestion'
-    })), {
+    })}\n\n`), {
       headers: { 'Content-Type': 'text/event-stream' }
     });
   }

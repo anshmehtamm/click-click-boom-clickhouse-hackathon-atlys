@@ -1,267 +1,105 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { ExternalLink, TrendingUp, AlertCircle } from 'lucide-react';
+import Link from 'next/link';
+import { GitBranch, Sparkles, TrendingUp, AlertCircle } from 'lucide-react';
+import { openAnalyticsPanel, openInsightTrace } from '@/lib/panel-context';
 
 // ── types ─────────────────────────────────────────────────────────────────────
 
-interface KnownIssue {
-  issue: string;
-  matching_criteria: string;
-  status: 'confirmed' | 'partial' | 'contradicted' | 'untested';
-}
-
-interface ChartRow { [key: string]: string | number | null }
-
-interface ChartData {
-  rows: ChartRow[];
-  n: number;
-}
-
-interface EvidenceData {
-  llm?: Record<string, unknown>;
-  chart_data?: {
-    feature_vs_baseline_cvr?: ChartData;
-    segment_breakdown?: ChartData;
-    funnel_baseline?: ChartData;
-    sample_size?: ChartData;
-  };
-}
-
 interface Insight {
   insight_id: string;
-  spec_name: string;
+  spec_name: string; // '' for a custom/broad-prompt investigation — see `prompt`
   title: string;
   summary: string;
   confidence: number;
   evidence: string;
   related_known_issues: string[];
   segment_cuts: string[];
+  has_report: boolean;
   created_at: string;
   trace_url: string | null;
+  prompt: string;
 }
 
-// ── small helpers ─────────────────────────────────────────────────────────────
+// ── confidence badge ─────────────────────────────────────────────────────────
+// Same three-tier color convention as everywhere else confidence shows up
+// (specs list's ConfidenceCell, agent-panel's insight/proposal widgets).
 
-function parseEvidence(raw: string): EvidenceData {
-  try { return JSON.parse(raw); } catch { return {}; }
-}
-
-function parseKnownIssues(raw: string[]): KnownIssue[] {
-  return raw.flatMap(s => {
-    try { return [JSON.parse(s) as KnownIssue]; } catch { return []; }
-  });
-}
-
-function pct(v: number | null | undefined) {
-  if (v == null) return '—';
-  const n = typeof v === 'number' ? v : parseFloat(String(v));
-  return isNaN(n) ? '—' : `${(n * 100).toFixed(1)}%`;
-}
-
-const STATUS_COLOR: Record<string, string> = {
-  confirmed:    '#16a34a',
-  partial:      '#d97706',
-  contradicted: '#dc2626',
-  untested:     '#9c9088',
-};
-
-// ── chart components (pure CSS, no library) ───────────────────────────────────
-
-function MiniBar({ value, max, color }: { value: number; max: number; color: string }) {
-  const w = max > 0 ? Math.round((value / max) * 100) : 0;
+function ConfidenceBadge({ score }: { score: number }) {
+  const pct   = Math.round(score * 100);
+  const color = pct >= 80 ? '#16a34a' : pct >= 60 ? '#d97706' : '#dc2626';
+  const bg    = pct >= 80 ? '#f0fdf4' : pct >= 60 ? '#fffbeb' : '#fef2f2';
   return (
-    <div className="h-2 w-full rounded-full overflow-hidden" style={{ backgroundColor: '#f0ece6' }}>
-      <div className="h-full rounded-full transition-all" style={{ width: `${w}%`, backgroundColor: color }} />
-    </div>
+    <span className="flex-shrink-0 text-[12px] font-bold tabular-nums font-mono rounded-lg px-2 py-1"
+      style={{ color, backgroundColor: bg }}>
+      {pct}%
+    </span>
   );
 }
 
-function ConversionChart({ data }: { data: ChartData }) {
-  const rows = data.rows.filter(r => r.cohort);
-  if (!rows.length) return null;
-  const maxRate = Math.max(...rows.map(r => parseFloat(String(r.conv_rate ?? 0))));
+// ── row ───────────────────────────────────────────────────────────────────────
+// One row = one insight. The full row opens the standalone report (the real
+// content — see analytics/analytics_agent.py's Stage 5); the trace icon is a
+// separate, smaller action that opens the SAME right panel used for live
+// runs, showing this insight's own persisted tool-call trace
+// (/api/insights/[id]/events) — a spec can have several insights now that
+// analytics is an explicit, re-runnable step, so this is scoped to exactly
+// the one the user clicked, not "this spec's latest trace."
 
-  return (
-    <div className="space-y-2">
-      <p className="text-[11px] font-semibold uppercase tracking-wide" style={{ color: '#9c9088' }}>
-        Conversion rate
-      </p>
-      {rows.map((r, i) => {
-        const rate = parseFloat(String(r.conv_rate ?? 0));
-        const isFeature = String(r.cohort) === 'feature';
-        const color = isFeature ? '#2563eb' : '#a8a29e';
-        const n = Number(r.started ?? 0);
-        return (
-          <div key={i} className="space-y-1">
-            <div className="flex items-center justify-between text-xs">
-              <span className="font-medium" style={{ color: '#1c1814' }}>
-                {String(r.cohort)}
-                {n < 30 && <span className="ml-1.5 text-[10px]" style={{ color: '#d97706' }}>* directional</span>}
-              </span>
-              <span className="font-mono font-semibold" style={{ color }}>
-                {pct(rate)} <span style={{ color: '#9c9088' }}>n={n.toLocaleString()}</span>
-              </span>
-            </div>
-            <MiniBar value={rate} max={maxRate} color={color} />
-          </div>
-        );
-      })}
-    </div>
-  );
-}
+function InsightRow({ ins }: { ins: Insight }) {
+  const body = (
+    <>
+      <ConfidenceBadge score={ins.confidence} />
 
-function SegmentChart({ data }: { data: ChartData }) {
-  const rows = data.rows.slice(0, 6).filter(r => r.n);
-  if (!rows.length) return null;
-  const maxN = Math.max(...rows.map(r => Number(r.n ?? 0)));
-
-  return (
-    <div className="space-y-2">
-      <p className="text-[11px] font-semibold uppercase tracking-wide" style={{ color: '#9c9088' }}>
-        By segment
-      </p>
-      {rows.map((r, i) => {
-        const n = Number(r.n ?? 0);
-        const label = [r.device_type, r.os, r.geoip_country_code].filter(Boolean).join(' / ') || 'unknown';
-        const directional = n < 30;
-        return (
-          <div key={i} className="space-y-1">
-            <div className="flex items-center justify-between text-xs">
-              <span className="truncate max-w-[55%]" style={{ color: '#4a4540' }}>
-                {label}
-                {directional && <span className="ml-1 text-[10px]" style={{ color: '#d97706' }}>*</span>}
-              </span>
-              <span className="font-mono text-[11px]" style={{ color: '#9c9088' }}>n={n}</span>
-            </div>
-            <MiniBar value={n} max={maxN} color={directional ? '#f5b556' : '#2563eb'} />
-          </div>
-        );
-      })}
-      {rows.some(r => Number(r.n) < 30) && (
-        <p className="text-[10px] mt-1" style={{ color: '#d97706' }}>* n&lt;30 — directional only</p>
-      )}
-    </div>
-  );
-}
-
-function FunnelChart({ data }: { data: ChartData }) {
-  const rows = data.rows.filter(r => r.step && r.users);
-  if (!rows.length) return null;
-  const max = Math.max(...rows.map(r => Number(r.users)));
-
-  return (
-    <div className="space-y-2">
-      <p className="text-[11px] font-semibold uppercase tracking-wide" style={{ color: '#9c9088' }}>
-        Existing funnel baseline
-      </p>
-      {rows.map((r, i) => {
-        const n = Number(r.users);
-        return (
-          <div key={i} className="space-y-1">
-            <div className="flex items-center justify-between text-xs">
-              <span style={{ color: '#4a4540' }}>{String(r.step).replace(/_/g, ' ')}</span>
-              <span className="font-mono text-[11px]" style={{ color: '#9c9088' }}>{n.toLocaleString()}</span>
-            </div>
-            <MiniBar value={n} max={max} color="#e5dfd6" />
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-function ConfidenceBar({ score }: { score: number }) {
-  const pctNum = Math.round(score * 100);
-  const color = pctNum >= 80 ? '#16a34a' : pctNum >= 60 ? '#d97706' : '#dc2626';
-  const bg    = pctNum >= 80 ? '#f0fdf4' : pctNum >= 60 ? '#fffbeb' : '#fef2f2';
-  return (
-    <div className="flex items-center gap-2">
-      <div className="h-1.5 w-24 rounded-full overflow-hidden" style={{ backgroundColor: '#f0ece6' }}>
-        <div className="h-full rounded-full" style={{ width: `${pctNum}%`, backgroundColor: color }} />
-      </div>
-      <span className="text-[11px] font-semibold rounded-full px-1.5 py-0.5"
-        style={{ color, backgroundColor: bg }}>
-        {pctNum}%
-      </span>
-    </div>
-  );
-}
-
-// ── insight card ──────────────────────────────────────────────────────────────
-
-function InsightCard({ ins }: { ins: Insight }) {
-  const evidence = parseEvidence(ins.evidence);
-  const cd = evidence.chart_data ?? {};
-  const knownIssues = parseKnownIssues(ins.related_known_issues ?? []);
-  const hasCharts = cd.feature_vs_baseline_cvr?.rows?.length || cd.segment_breakdown?.rows?.length;
-
-  return (
-    <div className="rounded-2xl border overflow-hidden" style={{ borderColor: '#e5dfd6', backgroundColor: '#ffffff' }}>
-      {/* Header */}
-      <div className="px-5 pt-5 pb-4">
-        <div className="flex items-start justify-between gap-3">
-          <h3 className="text-sm font-semibold leading-snug flex-1" style={{ color: '#1c1814' }}>
-            {ins.title}
-          </h3>
-          <ConfidenceBar score={ins.confidence} />
-        </div>
-        <p className="mt-2.5 text-sm leading-relaxed" style={{ color: '#4a4540' }}>
+      <div className="min-w-0">
+        <p className="text-[13.5px] font-semibold leading-snug truncate" style={{ color: '#1c1814' }}>
+          {ins.title}
+        </p>
+        <p className="mt-0.5 text-[12px] leading-snug line-clamp-1" style={{ color: '#9c9088' }}>
           {ins.summary}
         </p>
       </div>
 
-      {/* Charts */}
-      {hasCharts && (
-        <div className="grid gap-5 px-5 pb-5"
-          style={{ gridTemplateColumns: cd.feature_vs_baseline_cvr?.rows?.length && cd.segment_breakdown?.rows?.length ? '1fr 1fr' : '1fr' }}>
-          {cd.feature_vs_baseline_cvr?.rows?.length ? (
-            <ConversionChart data={cd.feature_vs_baseline_cvr} />
-          ) : null}
-          {cd.segment_breakdown?.rows?.length ? (
-            <SegmentChart data={cd.segment_breakdown} />
-          ) : null}
-        </div>
-      )}
-
-      {/* Funnel baseline collapsible — only show when interesting */}
-      {cd.funnel_baseline?.rows?.length ? (
-        <div className="px-5 pb-5">
-          <FunnelChart data={cd.funnel_baseline} />
-        </div>
-      ) : null}
-
-      {/* Known issues */}
-      {knownIssues.length > 0 && (
-        <div className="flex flex-wrap gap-2 px-5 pb-4">
-          {knownIssues.map((ki, i) => (
-            <span key={i} className="flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs"
-              style={{ backgroundColor: '#faf8f5', border: `1px solid #e5dfd6` }}>
-              <span className="h-1.5 w-1.5 rounded-full flex-shrink-0"
-                style={{ backgroundColor: STATUS_COLOR[ki.status] ?? '#9c9088' }} />
-              <span className="font-semibold" style={{ color: '#1c1814' }}>{ki.issue}</span>
-              <span style={{ color: '#9c9088' }}>{ki.matching_criteria}</span>
-              <span className="font-medium" style={{ color: STATUS_COLOR[ki.status] ?? '#9c9088' }}>
-                {ki.status}
-              </span>
-            </span>
-          ))}
-        </div>
-      )}
-
-      {/* Footer */}
-      <div className="flex items-center justify-between px-5 py-3 border-t" style={{ borderColor: '#f0ece6' }}>
-        <span className="text-xs" style={{ color: '#c0b8b0' }}>
-          {ins.spec_name} · {ins.created_at}
+      {ins.spec_name ? (
+        <span className="hidden sm:block flex-shrink-0 text-[11px] font-mono truncate max-w-[140px]" style={{ color: '#9c9088' }}>
+          {ins.spec_name}
         </span>
-        {ins.trace_url && (
-          <a href={ins.trace_url} target="_blank" rel="noopener noreferrer"
-            className="flex items-center gap-1 text-xs font-medium hover:opacity-70"
-            style={{ color: '#2563eb' }}>
-            View trace <ExternalLink className="h-3 w-3" />
-          </a>
-        )}
-      </div>
+      ) : (
+        <span className="hidden sm:flex flex-shrink-0 items-center gap-1 text-[11px] truncate max-w-[160px]"
+          title={ins.prompt} style={{ color: '#9c9088' }}>
+          <span className="flex-shrink-0 text-[9.5px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded"
+            style={{ color: '#7c3aed', backgroundColor: '#7c3aed15' }}>
+            custom
+          </span>
+          <span className="truncate">{ins.prompt}</span>
+        </span>
+      )}
+
+      <span className="hidden md:block flex-shrink-0 text-[11px] font-mono tabular-nums" style={{ color: '#c0b8b0' }}>
+        {ins.created_at.slice(5, 16).replace('T', ' ')}
+      </span>
+    </>
+  );
+
+  return (
+    <div className="flex items-center gap-4 px-4 py-3 border-b last:border-0 transition-colors hover:bg-stone-50"
+      style={{ borderColor: '#f0ece6' }}>
+      {ins.has_report ? (
+        <Link href={`/insights/${ins.insight_id}`} className="flex-1 min-w-0 flex items-center gap-4">
+          {body}
+        </Link>
+      ) : (
+        <div className="flex-1 min-w-0 flex items-center gap-4">{body}</div>
+      )}
+
+      <button
+        onClick={() => openInsightTrace({ insightId: ins.insight_id, title: ins.title, specName: ins.spec_name })}
+        title="View the tool-call trace behind this insight"
+        className="flex-shrink-0 flex h-7 w-7 items-center justify-center rounded-lg hover:bg-stone-200 transition-colors"
+        style={{ color: '#9c9088' }}>
+        <GitBranch className="h-3.5 w-3.5" />
+      </button>
     </div>
   );
 }
@@ -273,25 +111,43 @@ export default function InsightsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
 
-  useEffect(() => {
+  const refetch = () => {
     fetch('/api/insights')
       .then(r => r.json())
       .then(d => setInsights(Array.isArray(d) ? d : []))
       .catch(() => setError(true))
       .finally(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    refetch();
+    // agent-panel.tsx fires this after a successful analytics run
+    window.addEventListener('insights-updated', refetch);
+    return () => window.removeEventListener('insights-updated', refetch);
   }, []);
 
   return (
-    <div className="flex h-full flex-col">
-      <div className="border-b px-8 py-5" style={{ borderColor: '#e5dfd6' }}>
-        <h1 className="text-lg font-semibold" style={{ color: '#1c1814' }}>Insights</h1>
-        <p className="mt-0.5 text-sm" style={{ color: '#9c9088' }}>
-          PM-ready findings generated automatically after each spec is instrumented.
-          Charts use deterministic ClickHouse query results — every number traces to a logged query.
-        </p>
+    <div className="flex h-full flex-col" style={{ backgroundColor: '#faf8f5' }}>
+      {/* Header */}
+      <div className="flex items-center justify-between border-b px-8 py-5"
+        style={{ borderColor: '#e5dfd6', backgroundColor: '#ffffff' }}>
+        <div>
+          <h1 className="text-lg font-semibold" style={{ color: '#1c1814' }}>Insights</h1>
+          <p className="mt-0.5 text-sm" style={{ color: '#9c9088' }}>
+            PM-ready findings generated by the analytics agent for fully-executed specs.
+          </p>
+        </div>
+        <button
+          onClick={() => openAnalyticsPanel()}
+          className="flex flex-shrink-0 items-center gap-2 rounded-lg px-3.5 py-2 text-[13px] font-semibold text-white transition-opacity hover:opacity-90"
+          style={{ backgroundColor: '#16a34a' }}>
+          <Sparkles className="h-4 w-4" />
+          Create Insight
+        </button>
       </div>
 
-      <div className="flex-1 overflow-y-auto px-8 py-8">
+      {/* Content */}
+      <div className="flex-1 overflow-y-auto px-8 py-6">
         {loading && (
           <div className="flex h-40 items-center justify-center">
             <p className="text-sm" style={{ color: '#9c9088' }}>Loading…</p>
@@ -313,15 +169,21 @@ export default function InsightsPage() {
             </div>
             <h2 className="text-base font-semibold" style={{ color: '#1c1814' }}>No insights yet</h2>
             <p className="mt-1.5 max-w-xs text-sm" style={{ color: '#9c9088' }}>
-              Insights appear automatically after a spec runs through the full pipeline.
-              Submit a spec using the panel on the right.
+              Click <strong>Create Insight</strong> and pick a spec whose schema has been
+              fully executed — the analytics agent explores it live and writes the report.
             </p>
+            <button
+              onClick={() => openAnalyticsPanel()}
+              className="mt-6 flex items-center gap-2 rounded-xl px-5 py-2.5 text-sm font-semibold text-white hover:opacity-90"
+              style={{ backgroundColor: '#16a34a' }}>
+              <Sparkles className="h-4 w-4" /> Create Insight
+            </button>
           </div>
         )}
 
         {!loading && !error && insights.length > 0 && (
-          <div className="max-w-3xl space-y-6">
-            {insights.map(ins => <InsightCard key={ins.insight_id} ins={ins} />)}
+          <div className="rounded-xl border overflow-hidden" style={{ borderColor: '#e5dfd6', backgroundColor: '#ffffff' }}>
+            {insights.map(ins => <InsightRow key={ins.insight_id} ins={ins} />)}
           </div>
         )}
       </div>

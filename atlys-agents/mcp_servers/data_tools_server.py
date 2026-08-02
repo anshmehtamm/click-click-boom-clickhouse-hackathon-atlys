@@ -143,7 +143,17 @@ def grep_scratch(scratch_file: str, pattern: str, max_matches: int = 30) -> list
     """Greps a file saved by run_query for a regex pattern, returning matching
     lines only (case-insensitive). Use this instead of read_scratch when you're
     looking for something specific rather than browsing."""
+    # run_query's scratch_file pointer is an absolute path, but the proposer's
+    # OWN sample_events pointer (orchestrator/pipeline.py's
+    # _write_sample_scratch_file) is a bare filename -- execute_python's
+    # subprocess runs with cwd=SCRATCH_DIR so a bare name works there, but a
+    # relative Path is never is_relative_to an absolute SCRATCH_DIR, so callers
+    # passing that same bare filename here always 400'd even though the file
+    # genuinely exists. Resolve relative to SCRATCH_DIR before checking.
     path = pathlib.Path(scratch_file)
+    if not path.is_absolute():
+        path = SCRATCH_DIR / path
+    path = path.resolve()
     if not path.is_relative_to(SCRATCH_DIR):
         raise ValueError("scratch_file must be a path returned by run_query")
     regex = re.compile(pattern, re.IGNORECASE)
@@ -157,7 +167,17 @@ def read_scratch(scratch_file: str, start_line: int = 0, n_lines: int = 50) -> l
     start_line. Use this to browse when grep_scratch's pattern search isn't what
     you need."""
     n_lines = min(n_lines, MAX_LINES_RETURNED)
+    # run_query's scratch_file pointer is an absolute path, but the proposer's
+    # OWN sample_events pointer (orchestrator/pipeline.py's
+    # _write_sample_scratch_file) is a bare filename -- execute_python's
+    # subprocess runs with cwd=SCRATCH_DIR so a bare name works there, but a
+    # relative Path is never is_relative_to an absolute SCRATCH_DIR, so callers
+    # passing that same bare filename here always 400'd even though the file
+    # genuinely exists. Resolve relative to SCRATCH_DIR before checking.
     path = pathlib.Path(scratch_file)
+    if not path.is_absolute():
+        path = SCRATCH_DIR / path
+    path = path.resolve()
     if not path.is_relative_to(SCRATCH_DIR):
         raise ValueError("scratch_file must be a path returned by run_query")
     lines = path.read_text().splitlines()
@@ -194,20 +214,27 @@ def _check_imports_allowed(code: str) -> str | None:
 @server.tool()
 def execute_python(code: str) -> dict:
     """Runs Python for dataframe analysis SQL can't express cleanly (correlation,
-    pivoting, custom stats over a scratch file from run_query) — pandas ONLY, no
-    other imports permitted (checked before execution; you'll get an error, not a
-    silent failure, if you try). NOT strongly sandboxed — plain subprocess, same OS
-    privileges as this tool server, no container isolation, no network,
-    15s timeout. Working directory is the scratch dir, so
-    `pd.read_json("some_query_file.ndjson", lines=True)` works with just the
-    filename. Print everything you want to see; only stdout/stderr are returned
-    (truncated if long)."""
+    pivoting, custom stats over a scratch file from run_query) — pandas is ALREADY
+    imported as `pd`, don't import it yourself; no other imports permitted (checked
+    before execution; you'll get an error, not a silent failure, if you try). NOT
+    strongly sandboxed — plain subprocess, same OS privileges as this tool server,
+    no container isolation, no network, 15s timeout. Working directory is the
+    scratch dir, so `pd.read_json("some_query_file.ndjson", lines=True)` works with
+    just the filename. Print everything you want to see; only stdout/stderr are
+    returned (truncated if long)."""
     import_error = _check_imports_allowed(code)
     if import_error:
         return {"stdout": "", "stderr": import_error, "exit_code": -1, "truncated": False}
     try:
+        # pd pre-imported here rather than relying on the model to remember its
+        # own `import pandas as pd` -- a real run hit the identical NameError
+        # ("pd is not defined") repeatedly across several tool calls because it
+        # kept forgetting. Safe to prepend unconditionally: pandas is the only
+        # allowed import, and Python re-importing an already-imported module is
+        # a no-op if the model's own code also imports it.
+        full_code = "import pandas as pd\n" + code
         result = subprocess.run(
-            [sys.executable, "-c", code],
+            [sys.executable, "-c", full_code],
             cwd=SCRATCH_DIR, capture_output=True, text=True, timeout=EXEC_TIMEOUT_S,
         )
         return {

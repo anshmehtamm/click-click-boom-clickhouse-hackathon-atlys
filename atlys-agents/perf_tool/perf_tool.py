@@ -11,6 +11,7 @@ Never touches production tables (`atlys.*`); everything happens in `atlys_stagin
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -19,6 +20,17 @@ from typing import Any
 from agent_meta.db import get_client
 
 LEGACY_ORDERING_KEY = "(id, timestamp, user_id)"
+
+
+def _safe_identifier_fragment(text: str, max_len: int = 40) -> str:
+    """A candidate's `label` is documented as "short_label" in the proposer's
+    schema, but nothing enforces that -- a real run put a full descriptive
+    sentence there instead, which went straight into a scratch table name
+    unsanitized and broke with a SQL syntax error (spaces/colons aren't valid in
+    an identifier). Never trust LLM output as a raw SQL identifier fragment,
+    same principle as everywhere else names get built from agent output."""
+    slug = re.sub(r"[^a-zA-Z0-9_]+", "_", text).strip("_")
+    return slug[:max_len] or "candidate"
 
 
 @dataclass
@@ -110,13 +122,20 @@ def run_perf_test(
     reports: list[CandidateReport] = []
     errors: dict[str, str] = {}
     for cand in all_candidates:
-        scratch_table = f"{scratch_db}.{table_name}__{cand.label}__{uuid.uuid4().hex[:6]}"
+        scratch_table = f"{scratch_db}.{table_name}__{_safe_identifier_fragment(cand.label)}__{uuid.uuid4().hex[:6]}"
         try:
             client.command(f"DROP TABLE IF EXISTS {scratch_table}")
+            # cand.partition_key may be "" (orchestrator/pipeline.py normalizes an
+            # empty/prose partition_key to "" before building Candidate objects,
+            # rather than a real expression) -- a bare "PARTITION BY " with
+            # nothing after it makes ClickHouse read the next token (the literal
+            # word ORDER) as the partition expression and choke on the BY that
+            # follows. Omit the clause entirely when there's no real key.
+            partition_clause = f"PARTITION BY {cand.partition_key} " if cand.partition_key else ""
             client.command(
                 f"CREATE TABLE {scratch_table} ({columns_ddl}) "
                 f"ENGINE = MergeTree "
-                f"PARTITION BY {cand.partition_key} "
+                f"{partition_clause}"
                 f"ORDER BY {cand.ordering_key} "
                 # Nullable columns in ORDER BY are allowed here so perf_tool can time
                 # *any* candidate a proposer suggests. A Nullable ordering key is a
@@ -169,7 +188,16 @@ def run_perf_test(
             # AllCandidatesFailedError below with the details for rework.
             errors[cand.label] = str(e)
         finally:
-            client.command(f"DROP TABLE IF EXISTS {scratch_table}")
+            # Best-effort cleanup -- must never itself crash the pipeline. A real
+            # run hit exactly this: a malformed scratch_table identifier (from a
+            # bad table_name upstream) made even DROP TABLE IF EXISTS fail with a
+            # SYNTAX_ERROR, which (uncaught here) replaced the original, more
+            # informative CREATE/INSERT failure and took down the whole run
+            # instead of being recorded as this candidate's error.
+            try:
+                client.command(f"DROP TABLE IF EXISTS {scratch_table}")
+            except Exception as cleanup_err:
+                errors.setdefault(cand.label, f"(scratch cleanup also failed: {cleanup_err})")
 
     if not reports:
         raise AllCandidatesFailedError(errors)

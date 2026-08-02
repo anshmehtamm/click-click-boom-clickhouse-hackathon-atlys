@@ -336,8 +336,28 @@ progress for revision churn without making the answer any more correct.
 
 Always call list_context_sections and pull the sections relevant to this proposal's
 domain before judging it — don't review from the proposal text alone. Use run_query
-when a finding hinges on a factual claim about real data (e.g. "does this grain
+when a finding hinges on a factual claim against real data (e.g. "does this grain
 actually match what's in the raw sample" is better answered by checking, not assuming).
+
+Before applying a `convention:*` section as a requirement on THIS proposal, check
+whether its content actually names a specific other table (grep it for a table name
+in its title/summary/body/fields). A `convention:*` prefix signals "this is a general,
+project-wide rule" — but a chronicler can mis-scope a table-specific implementation
+note under that prefix by mistake. If a `convention:*` section is really about one
+named table's own pipeline (e.g. its ingestion path, its specific dedup/versioning
+scheme), it does NOT automatically bind an unrelated table's proposal just because it
+surfaced in the same lookup — only apply it here if the CURRENT proposal genuinely
+shares the underlying characteristic that motivated it (e.g. this table's producer can
+also emit true duplicates that must be reconciled, not just that both are "raw event
+tables"). Don't require deduplication/versioning/ledger machinery a proposal never
+needs just because a differently-named table once needed it. This happened for real: a
+visa_status_sharing_events-specific ingestion note, mis-scoped as `convention:*`, got
+applied wholesale to an unrelated checkout feature's review and drove it through its
+entire revision budget chasing requirements its spec never asked for. If a
+`convention:*` section reads as clearly table-specific rather than general, say so in
+your own findings/context_sections_used reasoning rather than treating it as binding,
+and flag it as a `contradicts_context`-adjacent info note (mis-scoped context, not a
+proposal defect) so the Chronicler can rescope it properly later.
 
 If the proposal includes `materialized_views` with JOINs against existing tables,
 verify the join keys and column names it references actually exist and actually mean

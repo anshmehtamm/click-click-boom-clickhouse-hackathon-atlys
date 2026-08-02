@@ -1,5 +1,5 @@
 import { createClient } from '@clickhouse/client';
-import type { Insight, ContextVersion, SchemaProposal, SchemaReview, TestRun } from './types';
+import type { Insight, ContextVersion, ContextSection, SchemaProposal, SchemaReview, TestRun } from './types';
 
 const client = createClient({
   url: process.env.CLICKHOUSE_HOST || 'https://your-instance.clickhouse.cloud:8443',
@@ -22,7 +22,8 @@ export async function getInsights(limit = 50): Promise<Insight[]> {
         segment_cuts,
         length(report_html) > 0 as has_report,
         formatDateTime(ts, '%Y-%m-%d %H:%i:%s') as created_at,
-        trace_url
+        trace_url,
+        prompt
       FROM agent_meta.insights
       ORDER BY ts DESC
       LIMIT ${limit}
@@ -52,27 +53,47 @@ export async function getInsightReport(insightId: string): Promise<string | null
   return rows[0]?.report_html || null;
 }
 
-export async function getContextVersions(limit = 100): Promise<ContextVersion[]> {
+// The changelog: every chronicle/seed write to the context layer, newest
+// first. `before` is '' for a pure addition, non-empty when this write
+// corrected an earlier claim -- that's the real "contradiction" signal, no
+// separate flagging mechanism needed (see agent_meta_ddl.sql's
+// context_versions comment).
+export async function getContextVersions(limit = 200, section?: string): Promise<ContextVersion[]> {
   const result = await client.query({
     query: `
       SELECT
-        version_id,
-        section as section_key,
-        before as old_content,
-        after as new_content,
-        diff_summary as change_reason,
-        trigger as changed_by_agent,
+        version_id, section, before, after, diff_summary, rationale, trigger, confidence,
         formatDateTime(ts, '%Y-%m-%d %H:%i:%s') as created_at,
         trace_url
       FROM agent_meta.context_versions
+      ${section ? 'WHERE section = {section:String}' : ''}
       ORDER BY ts DESC
       LIMIT ${limit}
+    `,
+    query_params: section ? { section } : undefined,
+    format: 'JSONEachRow',
+  });
+
+  return result.json<ContextVersion>();
+}
+
+// The current state of the context layer: one row per section, the latest
+// write (argMax'd by ts) -- what the analytics/proposer/reviewer agents
+// actually read via list_context_sections/lookup_context (see
+// mcp_servers/context_server.py). This is the view, not context_versions
+// itself, specifically so the dashboard shows exactly what the agents see.
+export async function getCurrentContext(): Promise<ContextSection[]> {
+  const result = await client.query({
+    query: `
+      SELECT section, content, confidence, trace_url,
+        formatDateTime(last_updated, '%Y-%m-%d %H:%i:%s') as last_updated
+      FROM agent_meta.current_context
+      ORDER BY section
     `,
     format: 'JSONEachRow',
   });
 
-  const data = await result.json<ContextVersion[]>();
-  return data;
+  return result.json<ContextSection>();
 }
 
 export async function getSchemaProposals(limit = 50): Promise<SchemaProposal[]> {

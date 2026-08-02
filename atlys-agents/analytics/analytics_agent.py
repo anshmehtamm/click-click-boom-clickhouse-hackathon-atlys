@@ -84,7 +84,34 @@ def _call_analytics(run, spec_name: str, table_name: str, spec_markdown: str) ->
     return result
 
 
-def _write_insight(meta_client, spec_name: str, analysis: dict, trace_url: str) -> str:
+def _call_analytics_custom(run, prompt: str) -> dict:
+    """Same call as _call_analytics, but for a free-text investigation with no
+    single table_name/spec handed to the agent -- see ANALYTICS_AGENT's
+    `custom_investigation` branch in agents/prompts.py. The agent decides which
+    table(s) matter itself via list_tables."""
+    payload = {
+        "trigger": "custom_investigation",
+        "prompt": prompt,
+        "database": "atlys",
+        "instruction": (
+            "A person asked a free-text question directly -- there is no single "
+            "table_name handed to you. Follow your system prompt's "
+            "custom_investigation branch of each stage: list_tables and pick "
+            "what's relevant, understand the real shape of each table you pick, "
+            "work through the question(s) in the prompt one by one with your own "
+            "queries, correlate with known issues, then write the full HTML report."
+        ),
+    }
+    result, _r = _call_json_agent(
+        "analytics_agent", payload, run, "analytics",
+        required_keys=["title", "summary", "confidence", "report_html"],
+        reasoning_fn=lambda parsed: parsed.get("summary"),
+        prompt=prompt[:200],
+    )
+    return result
+
+
+def _write_insight(meta_client, spec_name: str, analysis: dict, trace_url: str, prompt: str = "") -> str:
     insight_id = str(uuid.uuid4())
     known_issues_raw = analysis.get("related_known_issues", [])
     ki_serialized = [
@@ -104,10 +131,11 @@ def _write_insight(meta_client, spec_name: str, analysis: dict, trace_url: str) 
             float(analysis.get("confidence", 0.0)),
             trace_url,
             analysis.get("report_html", ""),
+            prompt,
         ]],
         column_names=["insight_id", "spec_name", "title", "summary",
                       "segment_cuts", "evidence", "related_known_issues",
-                      "confidence", "trace_url", "report_html"],
+                      "confidence", "trace_url", "report_html", "prompt"],
     )
     return insight_id
 
@@ -146,6 +174,36 @@ def run_analytics(run, spec_name: str, table_name: str, spec_markdown: str,
 
     with run.span("analytics_persist"):
         insight_id = _write_insight(meta_client, spec_name, analysis, run.url)
+        run.log(step="insight_written", input=None,
+                output={"insight_id": insight_id, "confidence": analysis.get("confidence"),
+                        "title": analysis.get("title", "")[:120]})
+
+    analysis["insight_id"] = insight_id
+    analysis["trace_url"] = run.url
+    return analysis
+
+
+def run_analytics_custom(run, prompt: str, meta_client) -> dict | None:
+    """Same loop as run_analytics(), for a free-text investigation with no
+    single spec/table attached. Skips the small-n row-count cap entirely --
+    that cap is keyed to one feature table's total row count, which doesn't
+    mean anything once the agent may be looking across several tables of very
+    different sizes; the agent's own per-query SMALL-N GATE (see
+    ANALYTICS_AGENT's Stage 3) is what actually governs confidence here."""
+    if not os.environ.get("OPENAI_API_KEY"):
+        run.log(step="analytics_skipped", input=None,
+                output="OPENAI_API_KEY not set — skipping analytics")
+        return None
+
+    with run.span("analytics_explore"):
+        try:
+            analysis = _call_analytics_custom(run, prompt)
+        except AgentOutputError as e:
+            run.log(step="analytics_json_error", input=e.raw_text[:1000], output=str(e.parse_error))
+            return None
+
+    with run.span("analytics_persist"):
+        insight_id = _write_insight(meta_client, "", analysis, run.url, prompt=prompt)
         run.log(step="insight_written", input=None,
                 output={"insight_id": insight_id, "confidence": analysis.get("confidence"),
                         "title": analysis.get("title", "")[:120]})
@@ -222,5 +280,36 @@ def run_analytics_for_spec(spec_name: str) -> dict:
             "title": analysis.get("title"),
             "confidence": analysis.get("confidence"),
             "table_name": table_name,
+            "trace_url": analysis.get("trace_url", run.url),
+        }
+
+
+def run_analytics_for_prompt(prompt: str) -> dict:
+    """Dashboard-triggered entry point for a free-text investigation -- the
+    counterpart to run_analytics_for_spec for when the person has a question
+    rather than a specific just-executed table in mind (see ANALYTICS_AGENT's
+    `custom_investigation` trigger). No spec/table lookup -- the agent decides
+    what's relevant to `prompt` itself via list_tables. Returns a summary dict
+    shaped like run_analytics_for_spec's so the dashboard's live-run panel can
+    treat both the same way.
+    """
+    if not prompt or not prompt.strip():
+        return {"status": "failed", "error": "Prompt is empty."}
+
+    meta_client = get_client(database="agent_meta")
+
+    with traced_run(agent="analytics", spec="") as run:
+        analysis = run_analytics_custom(run, prompt.strip(), meta_client)
+        if analysis is None:
+            return {
+                "status": "failed",
+                "error": "Analytics agent did not produce a usable result (not configured, or output couldn't be parsed) — check the trace.",
+                "trace_url": run.url,
+            }
+        return {
+            "status": "completed",
+            "insight_id": analysis.get("insight_id"),
+            "title": analysis.get("title"),
+            "confidence": analysis.get("confidence"),
             "trace_url": analysis.get("trace_url", run.url),
         }

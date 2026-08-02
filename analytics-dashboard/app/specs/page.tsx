@@ -91,7 +91,7 @@ function SpecRow({ spec, isLive }: { spec: SpecSummary; isLive: boolean }) {
 export default function SpecsPage() {
   const [specs,   setSpecs]   = useState<SpecSummary[]>([]);
   const [loading, setLoading] = useState(true);
-  const [liveSpecName, setLiveSpecName] = useState<string | null>(null);
+  const [liveSpecNames, setLiveSpecNames] = useState<Set<string>>(new Set());
 
   const refetch = () => {
     fetch('/api/specs')
@@ -108,34 +108,30 @@ export default function SpecsPage() {
     return () => window.removeEventListener('specs-updated', refetch);
   }, []);
 
-  // If an INGESTION is still running (e.g. this tab got reloaded mid-run),
+  // If any INGESTION is still running (e.g. this tab got reloaded mid-run),
   // reopen the panel automatically -- it reattaches to the live trace itself
-  // via lib/live-run-store.ts on mount. Also poll for which spec (if any) is
-  // ACTUALLY live right now, so each row's status reflects real-time truth
-  // instead of a frozen status enum (see StatusDot's comment) -- stops
-  // polling once nothing is active.
+  // via lib/live-run-store.ts on mount. Also poll for which specs (plural --
+  // several ingestions can be genuinely active at once now, each tracked by
+  // its own runId, see lib/live-run-store.ts) are ACTUALLY live right now, so
+  // each row's status reflects real-time truth instead of a frozen status
+  // enum (see StatusDot's comment) -- stops polling once nothing is active.
   //
-  // Scoped to kind === 'ingest' specifically -- live-run-store's single slot
-  // is shared with analytics runs (/api/analytics, see lib/live-run-store.ts's
-  // `kind` docstring). Without this check, triggering analytics on a spec
-  // (only possible once it's already 'executed', i.e. NOT actually running)
-  // made this page auto-open the ingest panel and mark that row "Running" for
-  // a pipeline that was never running -- the ingest panel then reattached to
-  // nothing (its own reconnect effect correctly requires kind === 'ingest'
-  // too), leaving an auto-opened panel stuck showing "New Spec" idle while
-  // the real analytics run was active elsewhere.
+  // Scoped to kind='ingest' specifically -- an active analytics run
+  // (/api/analytics) is a different kind of run entirely and must never mark
+  // a spec's row "Running" here (that page auto-opening the ingest panel for
+  // a pipeline that was never running was a real bug this scoping fixed).
   useEffect(() => {
     let timer: ReturnType<typeof setInterval> | null = null;
     const poll = () => {
-      fetch('/api/live-run').then(r => r.json()).then(d => {
-        setLiveSpecName(d.active && d.kind === 'ingest' ? d.specName : null);
-        if (!(d.active && d.kind === 'ingest') && timer) { clearInterval(timer); timer = null; }
+      fetch('/api/live-run?kind=ingest').then(r => r.json()).then((d: { runs: { label: string }[] }) => {
+        setLiveSpecNames(new Set(d.runs.map(r => r.label)));
+        if (d.runs.length === 0 && timer) { clearInterval(timer); timer = null; }
       }).catch(() => {});
     };
-    fetch('/api/live-run').then(r => r.json()).then(d => {
-      if (d.active && d.kind === 'ingest') {
+    fetch('/api/live-run?kind=ingest').then(r => r.json()).then((d: { runs: { label: string }[] }) => {
+      if (d.runs.length > 0) {
         openAgentPanel();
-        setLiveSpecName(d.specName);
+        setLiveSpecNames(new Set(d.runs.map(r => r.label)));
         timer = setInterval(poll, 3000);
       }
     }).catch(() => {});
@@ -202,7 +198,7 @@ export default function SpecsPage() {
                 </span>
               ))}
             </div>
-            {specs.map(s => <SpecRow key={s.spec_name} spec={s} isLive={s.spec_name === liveSpecName} />)}
+            {specs.map(s => <SpecRow key={s.spec_name} spec={s} isLive={liveSpecNames.has(s.spec_name)} />)}
           </div>
         )}
       </div>

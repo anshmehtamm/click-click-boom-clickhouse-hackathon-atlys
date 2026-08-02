@@ -9,7 +9,7 @@ import { openAnalyticsPanel, openInsightTrace } from '@/lib/panel-context';
 
 interface Insight {
   insight_id: string;
-  spec_name: string;
+  spec_name: string; // '' for a custom/broad-prompt investigation — see `prompt`
   title: string;
   summary: string;
   confidence: number;
@@ -19,6 +19,7 @@ interface Insight {
   has_report: boolean;
   created_at: string;
   trace_url: string | null;
+  prompt: string;
 }
 
 // ── confidence badge ─────────────────────────────────────────────────────────
@@ -60,9 +61,20 @@ function InsightRow({ ins }: { ins: Insight }) {
         </p>
       </div>
 
-      <span className="hidden sm:block flex-shrink-0 text-[11px] font-mono truncate max-w-[140px]" style={{ color: '#9c9088' }}>
-        {ins.spec_name}
-      </span>
+      {ins.spec_name ? (
+        <span className="hidden sm:block flex-shrink-0 text-[11px] font-mono truncate max-w-[140px]" style={{ color: '#9c9088' }}>
+          {ins.spec_name}
+        </span>
+      ) : (
+        <span className="hidden sm:flex flex-shrink-0 items-center gap-1 text-[11px] truncate max-w-[160px]"
+          title={ins.prompt} style={{ color: '#9c9088' }}>
+          <span className="flex-shrink-0 text-[9.5px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded"
+            style={{ color: '#7c3aed', backgroundColor: '#7c3aed15' }}>
+            custom
+          </span>
+          <span className="truncate">{ins.prompt}</span>
+        </span>
+      )}
 
       <span className="hidden md:block flex-shrink-0 text-[11px] font-mono tabular-nums" style={{ color: '#c0b8b0' }}>
         {ins.created_at.slice(5, 16).replace('T', ' ')}

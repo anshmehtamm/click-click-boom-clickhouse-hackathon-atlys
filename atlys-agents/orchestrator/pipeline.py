@@ -40,7 +40,7 @@ SCRATCH_DIR.mkdir(exist_ok=True)
 # (all three now feed back into the same propose->review->test->execute loop) —
 # higher than a review-only cap would need, since it now has to cover more failure
 # modes with the same total attempts.
-MAX_REVISIONS = 10
+MAX_REVISIONS = 15
 
 
 # AgentOutputError, _extract_json, _call_json_agent now live in
@@ -649,6 +649,38 @@ def ingest_spec(
                     "severity": "block", "category": "invalid_json",
                     "description": f"materialized_views item(s) at index {bad_mvs} are missing 'name' and/or 'ddl'. Every MV needs both.",
                     "suggested_fix": "Fix the materialized_views array so every item has 'name' (string) and 'ddl' (the full CREATE MATERIALIZED VIEW statement) as keys.",
+                }], revision)
+                continue
+
+            # Same failure class, one level deeper: an mv dict CAN have both
+            # 'name' and 'ddl' keys (passing the check above) while 'ddl'
+            # itself is only the backing target table's CREATE TABLE
+            # statement, missing the actual `CREATE MATERIALIZED VIEW ... AS
+            # SELECT ...` that makes it a materialized view at all -- a real
+            # run submitted exactly this for 4 revisions straight (7-10),
+            # burning the whole MAX_REVISIONS budget on a proposal that could
+            # never pass test_harness's mv_integrity query-logic check:
+            # test_harness.py's _extract_select correctly found no "AS
+            # SELECT" (there wasn't one) and returned the ddl unchanged, which
+            # then got wrapped as `SELECT count() FROM (CREATE TABLE ...)` --
+            # a guaranteed ClickHouse syntax error that read like a
+            # test_harness bug but was actually malformed proposer output.
+            # Catching it here is a cheap, deterministic, one-line-regex
+            # check instead of spending a full review + data-insert test
+            # cycle to discover the same thing.
+            incomplete_mvs = [
+                i for i, mv in enumerate(mvs)
+                if isinstance(mv.get("ddl"), str) and not re.search(r"CREATE\s+MATERIALIZED\s+VIEW", mv["ddl"], re.IGNORECASE)
+            ]
+            if incomplete_mvs:
+                run.log(step="propose_incomplete_mv_ddl", input=mvs, output=f"no CREATE MATERIALIZED VIEW statement at index {incomplete_mvs}")
+                if revision >= MAX_REVISIONS:
+                    raise ValueError(f"materialized_views items at index {incomplete_mvs} have no CREATE MATERIALIZED VIEW statement, revision cap reached")
+                revision += 1
+                prior_findings = _record_findings(finding_history, [{
+                    "severity": "block", "category": "invalid_ddl",
+                    "description": f"materialized_views item(s) at index {incomplete_mvs} don't contain a CREATE MATERIALIZED VIEW statement anywhere in their 'ddl' -- looks like only the backing target table's CREATE TABLE was included.",
+                    "suggested_fix": "If this MV needs a separate backing target table (a `TO`-target pattern), 'ddl' must contain BOTH statements: the backing CREATE TABLE AND the CREATE MATERIALIZED VIEW ... TO <target> AS SELECT ... that actually populates it, separated by ';'. A bare backing table with no MATERIALIZED VIEW statement never gets data written to it.",
                 }], revision)
                 continue
 

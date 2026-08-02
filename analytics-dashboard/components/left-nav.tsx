@@ -3,7 +3,7 @@
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { cn } from '@/lib/utils';
-import { FileText, Lightbulb, Database } from 'lucide-react';
+import { FileText, Lightbulb, Database, BookOpen } from 'lucide-react';
 
 // Traces used to be its own nav item, but a run's live trace (reasoning +
 // every tool call, same widgets) now renders directly in the run panel on
@@ -13,6 +13,7 @@ const nav = [
   { name: 'Specs',    href: '/specs',    icon: FileText  },
   { name: 'Insights', href: '/insights', icon: Lightbulb },
   { name: 'Schemas',  href: '/schemas',  icon: Database  },
+  { name: 'Context',  href: '/context',  icon: BookOpen  },
 ];
 
 export function LeftNav() {

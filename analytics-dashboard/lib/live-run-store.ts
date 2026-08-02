@@ -1,94 +1,179 @@
-// Tracks the currently in-progress (or most-recently-finished) ingestion run
-// server-side, independent of any single browser request.
+// Tracks every in-progress (or recently-finished) pipeline run server-side,
+// independent of any single browser request.
 //
-// Why this exists: /api/ingest streams progress back over the SAME HTTP
-// response that started the run (a POST whose body is an SSE stream). That
-// works fine while the tab that started it stays open, but the stream is
-// tied to that one request/response pair -- a page reload (or opening the
-// app in a second tab) has no way to reattach to it, so the live trace of an
-// still-running ingestion was simply gone after a reload. This module is fed
-// by /api/ingest as it already parses each line, and any client can query
-// /api/live-run to get the current snapshot (active or not) and reconnect.
+// Why this exists: /api/ingest and /api/analytics stream progress back over
+// the SAME HTTP response that started the run (a POST whose body is an SSE
+// stream). That works fine while the tab that started it stays open, but the
+// stream is tied to that one request/response pair -- a page reload (or
+// opening the app in a second tab) has no way to reattach to it. This module
+// is fed by both routes as they parse each line, and any client can query
+// /api/live-run to discover what's active and reconnect.
 //
-// Backed by a file, not a plain in-memory `let state` object: Next.js dev
-// mode hot-reloads any route module whenever a file in its dependency graph
-// changes, which re-evaluates this module and resets a plain in-memory
-// variable back to its initial value -- while the spawned Python subprocess
-// (a real, separate OS process) keeps writing genuine progress completely
-// unaffected. Two real incidents from this: an active run's proposal
-// appearing to vanish from the UI, and a run that had already finished (161
-// events, ended in revision_cap_hit/approved/test_harness, confirmed via
-// agent_meta.trace_events) staying stuck showing a stale 14-event snapshot
-// from before an unrelated edit reloaded the module mid-run -- `active` never
-// flipped to false because `finishRun` landed on a DIFFERENT, later module
-// instance than the one `/api/live-run`'s GET handler was reading from. A
-// file on disk survives module re-evaluation because it isn't part of the
-// module's JS heap.
+// Two real incidents shaped this design, in order:
 //
-// Single active run, not a queue: this pipeline is used interactively, one
-// ingestion (or one analytics run) at a time, from one dev server process --
-// no need for multi-run tracking. `kind` distinguishes an ingestion run
-// (/api/ingest, agent='pipeline': propose/review/execute) from an analytics
-// run (/api/analytics, agent='analytics') sharing this same slot -- see
-// agent-panel.tsx's reconnect checks, which require the kind to match what
-// they actually mean before treating a snapshot as "this is live".
+// 1. A plain in-memory `let state = {...}` object got reset by Next.js
+//    dev-mode hot-reload (which re-evaluates a route module whenever a file
+//    in its dependency graph changes) while a run was genuinely still going
+//    -- the spawned Python subprocess (a separate OS process) kept writing
+//    real progress the reset module could never see again. Fixed by backing
+//    state with a file instead of a JS variable.
+//
+// 2. That file-backed fix then went stale a DIFFERENT way: if the dev server
+//    process itself restarts, or the spawned child dies without its `close`
+//    handler ever running (killed externally, server crash), nothing calls
+//    finishRun() -- and unlike the old in-memory version (which reset to a
+//    clean slate for free on every server restart), the file just sits there
+//    claiming `active: true` forever, since nothing else ever touches it.
+//    There was also a real, separate design gap underneath both bugs: a
+//    SINGLE global slot means two simultaneous runs (e.g. an ingestion and a
+//    custom analytics investigation started back to back) always collide --
+//    the second either gets rejected outright or silently clobbers the
+//    first's polling clients.
+//
+// Fixed by moving to a MAP of runs keyed by runId (so concurrent runs are
+// simply different entries, never collide) where every entry also carries
+// the spawned process's PID -- staleness is detected by checking whether
+// that PID is still alive (`process.kill(pid, 0)`), not by trusting a stored
+// boolean that nothing may ever get the chance to flip back. This self-heals
+// regardless of *how* a run's tracking went stale (HMR reset is no longer
+// possible at all now that it's file-backed, but a killed process is now
+// self-diagnosed instead of remembered as a lie).
 
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import crypto from 'crypto';
 
 const STATE_FILE = path.join(os.tmpdir(), 'atlys-live-run-state.json');
 
 export type LiveRunKind = 'ingest' | 'analytics';
 
 export interface LiveRunSnapshot {
-  specName: string | null;
-  kind: LiveRunKind | null;
+  runId: string;
+  kind: LiveRunKind;
+  label: string;          // spec name, or a truncated custom prompt -- display only
   active: boolean;
-  startedAt: number | null;
-  events: Record<string, any>[]; // raw trace_event payloads, same shape /api/ingest forwards
+  pid: number | null;
+  startedAt: number;
+  events: Record<string, any>[]; // raw trace_event payloads, same shape the routes forward
   result: Record<string, any> | null;
 }
 
-const EMPTY_STATE: LiveRunSnapshot = {
-  specName: null, kind: null, active: false, startedAt: null, events: [], result: null,
-};
+type StateFile = Record<string, LiveRunSnapshot>;
 
-function readState(): LiveRunSnapshot {
+function readAll(): StateFile {
   try {
     return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
   } catch {
-    return EMPTY_STATE;
+    return {};
   }
 }
 
-function writeState(state: LiveRunSnapshot): void {
+function writeAll(map: StateFile): void {
   try {
-    // Synchronous and same-tick with every caller (all of which originate
-    // from one spawned child process's stdout 'data' handler within one
-    // Node event loop) -- no concurrent-write race in practice.
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state));
+    fs.writeFileSync(STATE_FILE, JSON.stringify(map));
   } catch {
-    // Best-effort -- losing the durability layer shouldn't crash the run.
+    // Best-effort -- losing the durability layer shouldn't crash a run.
   }
 }
 
-export function startRun(specName: string, kind: LiveRunKind = 'ingest'): void {
-  writeState({ specName, kind, active: true, startedAt: Date.now(), events: [], result: null });
+function isPidAlive(pid: number | null): boolean {
+  if (pid == null) return false;
+  try {
+    // Signal 0 sends nothing -- it only checks whether the process exists
+    // and is signalable, which is exactly the liveness check needed here.
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
-export function pushRawEvent(event: Record<string, any>): void {
-  const state = readState();
-  if (!state.active) return;
-  state.events.push(event);
-  writeState(state);
+// Any run still marked `active` whose pid is no longer alive gets healed to
+// `active: false` with a synthetic failure result, lazily, on read -- so a
+// stuck entry can never require manual intervention (see incident #2 above).
+function heal(map: StateFile): { map: StateFile; changed: boolean } {
+  let changed = false;
+  for (const run of Object.values(map)) {
+    if (run.active && !isPidAlive(run.pid)) {
+      run.active = false;
+      run.result = run.result ?? {
+        status: 'failed',
+        error: 'The process behind this run is no longer running (dev server restarted, or it was killed) -- the trace above may be incomplete.',
+      };
+      changed = true;
+    }
+  }
+  return { map, changed };
 }
 
-export function finishRun(result: Record<string, any>): void {
-  const state = readState();
-  writeState({ ...state, active: false, result });
+function readHealed(): StateFile {
+  const { map, changed } = heal(readAll());
+  if (changed) writeAll(map);
+  return map;
 }
 
-export function getSnapshot(): LiveRunSnapshot {
-  return readState();
+// Runs older than this are dropped from the file on the next write so it
+// doesn't grow forever across a long dev session -- generous, since a
+// finished run's own trace lives durably in ClickHouse regardless; this file
+// only needs to cover "reconnect to something recent."
+const MAX_AGE_MS = 6 * 60 * 60 * 1000;
+
+function prune(map: StateFile): StateFile {
+  const cutoff = Date.now() - MAX_AGE_MS;
+  const out: StateFile = {};
+  for (const [id, run] of Object.entries(map)) {
+    if (run.active || run.startedAt >= cutoff) out[id] = run;
+  }
+  return out;
+}
+
+export function startRun(label: string, kind: LiveRunKind): string {
+  const runId = crypto.randomUUID();
+  const map = prune(readHealed());
+  map[runId] = {
+    runId, kind, label, active: true, pid: null,
+    startedAt: Date.now(), events: [], result: null,
+  };
+  writeAll(map);
+  return runId;
+}
+
+export function setPid(runId: string, pid: number): void {
+  const map = readAll();
+  if (map[runId]) {
+    map[runId].pid = pid;
+    writeAll(map);
+  }
+}
+
+export function pushRawEvent(runId: string, event: Record<string, any>): void {
+  const map = readAll();
+  const run = map[runId];
+  if (!run || !run.active) return;
+  run.events.push(event);
+  writeAll(map);
+}
+
+export function finishRun(runId: string, result: Record<string, any>): void {
+  const map = readAll();
+  if (map[runId]) {
+    map[runId].active = false;
+    map[runId].result = result;
+    writeAll(map);
+  }
+}
+
+export function getRun(runId: string): LiveRunSnapshot | null {
+  return readHealed()[runId] ?? null;
+}
+
+// What a client with no runId yet needs to discover what to reconnect to --
+// optionally filtered by kind ('ingest' vs 'analytics', since they now run
+// independently and a caller usually only cares about one).
+export function listActiveRuns(kind?: LiveRunKind): LiveRunSnapshot[] {
+  const map = readHealed();
+  return Object.values(map)
+    .filter(r => r.active && (!kind || r.kind === kind))
+    .sort((a, b) => b.startedAt - a.startedAt);
 }

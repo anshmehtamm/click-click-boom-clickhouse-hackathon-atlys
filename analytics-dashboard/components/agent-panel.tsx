@@ -6,6 +6,7 @@ import { usePanelCtx } from '@/lib/panel-context';
 import { TraceViewer } from '@/components/trace/TraceViewer';
 import type { AgentEvent } from '@/components/trace/types';
 import type { SpecSummary } from '@/app/api/specs/route';
+import type { LiveRunSnapshot } from '@/lib/live-run-store';
 
 // ── types ─────────────────────────────────────────────────────────────────────
 
@@ -204,9 +205,9 @@ export function AgentPanel() {
         .finally(() => setHistoryLoading(false));
     };
 
-    const pollLive = () => {
-      fetch('/api/live-run').then(r => r.json()).then(d => {
-        if (d.specName !== historySpec || d.kind !== 'ingest') return; // a different spec, or an analytics run for this spec, started while we were watching
+    const pollLive = (runId: string) => {
+      fetch(`/api/live-run?runId=${runId}`).then(r => r.json()).then((d: LiveRunSnapshot | null) => {
+        if (!d) { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } loadPersisted(); return; }
         setHistoryEvents(d.events.map(normalizeTraceEvent));
         if (!d.active) {
           if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
@@ -217,15 +218,18 @@ export function AgentPanel() {
     };
 
     // historySpec always means "this spec's ingestion trace" -- an in-flight
-    // analytics run for this same (already-executed) spec shares the store's
-    // specName but must never be shown here (see live-run-store.ts's kind doc).
-    fetch('/api/live-run').then(r => r.json()).then(d => {
-      if (d.active && d.specName === historySpec && d.kind === 'ingest') {
+    // analytics run for this same (already-executed) spec is a DIFFERENT run
+    // (its own runId, kind 'analytics') and must never be shown here (see
+    // lib/live-run-store.ts's kind doc). Multiple ingestions can be active at
+    // once now -- find the one (if any) whose label matches this spec.
+    fetch('/api/live-run?kind=ingest').then(r => r.json()).then((d: { runs: LiveRunSnapshot[] }) => {
+      const match = d.runs.find(r => r.label === historySpec);
+      if (match) {
         setHistoryIsLive(true);
         setHistoryLoading(false);
-        setHistoryEvents(d.events.map(normalizeTraceEvent));
+        setHistoryEvents(match.events.map(normalizeTraceEvent));
         setHistoryMeta({ status: 'running' });
-        pollTimer = setInterval(pollLive, 1500);
+        pollTimer = setInterval(() => pollLive(match.runId), 1500);
       } else {
         loadPersisted();
       }
@@ -290,29 +294,33 @@ export function AgentPanel() {
     if (panelMode !== 'new' && panelMode !== 'analytics') return;
     let pollTimer: ReturnType<typeof setInterval> | null = null;
 
-    // Only reconnect into 'running' -- a leftover FINISHED snapshot from
-    // whatever ran last must never hijack a fresh panel open into showing a
-    // stale result (the store keeps the last result around only so a reload
-    // during the trailing "Done" screen doesn't lose it, not so the NEXT
-    // unrelated panel open inherits it).
+    // Only reconnect into 'running' -- a leftover FINISHED run must never
+    // hijack a fresh panel open into showing a stale result (finished runs
+    // stay in the store for a while so a reload during the trailing "Done"
+    // screen doesn't lose it, not so the NEXT unrelated panel open inherits
+    // it). Several runs of this kind can be active at once now -- this one
+    // panel instance just reconnects to the most recent (listActiveRuns
+    // returns newest-first).
     const expectedKind = panelMode === 'analytics' ? 'analytics' : 'ingest';
-    const applySnapshot = (data: { specName: string | null; kind: string | null; active: boolean; events: any[]; result: any }): boolean => {
-      if (!data.active || !data.specName || data.kind !== expectedKind) return false;
-      setSpecName(data.specName);
-      setTraceEvents(data.events.map(normalizeTraceEvent));
+    const applyRun = (run: LiveRunSnapshot | undefined | null): boolean => {
+      if (!run || !run.active) return false;
+      setSpecName(run.label);
+      setTraceEvents(run.events.map(normalizeTraceEvent));
       setMode('running');
       return true;
     };
 
-    fetch('/api/live-run').then(r => r.json()).then(data => {
-      const active = applySnapshot(data);
+    fetch(`/api/live-run?kind=${expectedKind}`).then(r => r.json()).then((data: { runs: LiveRunSnapshot[] }) => {
+      const current = data.runs[0];
+      const active = applyRun(current);
       if (active) {
+        const runId = current.runId;
         pollTimer = setInterval(() => {
-          fetch('/api/live-run').then(r => r.json()).then(d => {
-            const stillActive = applySnapshot(d);
+          fetch(`/api/live-run?runId=${runId}`).then(r => r.json()).then((d: LiveRunSnapshot | null) => {
+            const stillActive = applyRun(d);
             if (!stillActive) {
               if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-              if (d.result) { setResult(d.result); setMode('done'); }
+              if (d?.result) { setResult(d.result as RunResult); setMode('done'); }
             }
           }).catch(() => {});
         }, 1500);
@@ -335,6 +343,16 @@ export function AgentPanel() {
   // early filter so an ineligible spec never even shows up to click).
   const [eligibleSpecs, setEligibleSpecs] = useState<SpecSummary[]>([]);
   const [eligibleLoading, setEligibleLoading] = useState(false);
+
+  // Analytics mode has two ways in: pick an already-executed spec (existing
+  // flow, scoped to that spec's own PM questions), or type a free-text
+  // question with no single table in mind -- run_analytics_for_prompt, see
+  // ANALYTICS_AGENT's custom_investigation branch in agents/prompts.py. Kept
+  // as a separate `customPrompt` state rather than overloading `specName`
+  // (which the running/done screens already use as a display label) so the
+  // POST payload and the label text can't accidentally diverge.
+  const [analyticsTab, setAnalyticsTab] = useState<'spec' | 'custom'>('spec');
+  const [customPrompt, setCustomPrompt] = useState('');
 
   useEffect(() => {
     if (panelMode !== 'analytics') return;
@@ -434,7 +452,8 @@ export function AgentPanel() {
   };
 
   const handleRunAnalytics = async () => {
-    if (!specName) return;
+    const isCustom = analyticsTab === 'custom';
+    if (isCustom ? !customPrompt.trim() : !specName) return;
     setMode('running');
     setLogs([]);
     setTraceEvents([]);
@@ -444,7 +463,7 @@ export function AgentPanel() {
       const res = await fetch('/api/analytics', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ specName }),
+        body: JSON.stringify(isCustom ? { prompt: customPrompt.trim() } : { specName }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       await consumeSSEStream(res);
@@ -640,48 +659,94 @@ export function AgentPanel() {
           </div>
         )}
 
-        {/* ANALYTICS IDLE — pick which fully-executed spec to run analytics
-            against (gated the same way run_analytics_for_spec gates
-            server-side: only specs whose latest proposal reached 'executed'). */}
+        {/* ANALYTICS IDLE — either pick which fully-executed spec to run
+            analytics against (gated the same way run_analytics_for_spec gates
+            server-side: only specs whose latest proposal reached 'executed'),
+            or ask a free-text question with no single table in mind
+            (run_analytics_for_prompt -- the agent decides what's relevant
+            itself via list_tables, see ANALYTICS_AGENT's custom_investigation
+            branch). */}
         {panelMode === 'analytics' && mode === 'idle' && (
           <div className="p-5">
-            <p className="mb-3 text-xs leading-relaxed" style={{ color: '#9c9088' }}>
-              Pick a spec whose schema has been fully executed. The analytics agent explores its
-              table live — via its own queries, not canned ones — and writes a PM-ready insight report.
-            </p>
-            {eligibleLoading && (
-              <p className="py-8 text-center text-xs" style={{ color: '#c0b8b0' }}>Loading eligible specs…</p>
-            )}
-            {!eligibleLoading && eligibleSpecs.length === 0 && (
-              <div className="flex flex-col items-center gap-3 py-10 text-center">
-                <LineChart className="h-7 w-7" style={{ color: '#c0b8b0' }} />
-                <p className="max-w-xs text-xs" style={{ color: '#9c9088' }}>
-                  No fully-executed specs yet. Run a spec through ingestion until its schema is
-                  <span className="font-semibold"> executed</span> before analytics can run on it.
+            <div className="mb-4 flex rounded-xl border p-1" style={{ borderColor: '#e5dfd6', backgroundColor: '#faf8f5' }}>
+              {(['spec', 'custom'] as const).map(tab => (
+                <button
+                  key={tab}
+                  onClick={() => setAnalyticsTab(tab)}
+                  className="flex-1 rounded-lg py-1.5 text-xs font-semibold transition-colors"
+                  style={analyticsTab === tab
+                    ? { backgroundColor: '#ffffff', color: '#1c1814', boxShadow: '0 1px 2px rgba(0,0,0,0.06)' }
+                    : { color: '#9c9088' }}>
+                  {tab === 'spec' ? 'From a spec' : 'Custom question'}
+                </button>
+              ))}
+            </div>
+
+            {analyticsTab === 'spec' ? (
+              <>
+                <p className="mb-3 text-xs leading-relaxed" style={{ color: '#9c9088' }}>
+                  Pick a spec whose schema has been fully executed. The analytics agent explores its
+                  table live — via its own queries, not canned ones — and writes a PM-ready insight report.
                 </p>
-              </div>
-            )}
-            {!eligibleLoading && eligibleSpecs.length > 0 && (
-              <div className="rounded-xl border overflow-hidden" style={{ borderColor: '#e5dfd6' }}>
-                {eligibleSpecs.map(s => (
-                  <button
-                    key={s.spec_name}
-                    onClick={() => { setSpecName(s.spec_name); setMode('folder-selected'); }}
-                    className="w-full flex items-center justify-between gap-3 px-4 py-3 text-left hover:bg-stone-50 border-b last:border-0 transition-colors"
-                    style={{ borderColor: '#f0ece6' }}>
-                    <div className="min-w-0">
-                      <p className="text-[13px] font-semibold font-mono truncate" style={{ color: '#1c1814' }}>{s.spec_name}</p>
-                      <p className="text-[11px] font-mono truncate" style={{ color: '#9c9088' }}>{s.table_name || '—'}</p>
-                    </div>
-                    {s.has_insight > 0 && (
-                      <span className="flex-shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded"
-                        style={{ color: '#16a34a', backgroundColor: '#f0fdf4' }}>
-                        has insight
-                      </span>
-                    )}
-                  </button>
-                ))}
-              </div>
+                {eligibleLoading && (
+                  <p className="py-8 text-center text-xs" style={{ color: '#c0b8b0' }}>Loading eligible specs…</p>
+                )}
+                {!eligibleLoading && eligibleSpecs.length === 0 && (
+                  <div className="flex flex-col items-center gap-3 py-10 text-center">
+                    <LineChart className="h-7 w-7" style={{ color: '#c0b8b0' }} />
+                    <p className="max-w-xs text-xs" style={{ color: '#9c9088' }}>
+                      No fully-executed specs yet. Run a spec through ingestion until its schema is
+                      <span className="font-semibold"> executed</span> before analytics can run on it.
+                    </p>
+                  </div>
+                )}
+                {!eligibleLoading && eligibleSpecs.length > 0 && (
+                  <div className="rounded-xl border overflow-hidden" style={{ borderColor: '#e5dfd6' }}>
+                    {eligibleSpecs.map(s => (
+                      <button
+                        key={s.spec_name}
+                        onClick={() => { setSpecName(s.spec_name); setMode('folder-selected'); }}
+                        className="w-full flex items-center justify-between gap-3 px-4 py-3 text-left hover:bg-stone-50 border-b last:border-0 transition-colors"
+                        style={{ borderColor: '#f0ece6' }}>
+                        <div className="min-w-0">
+                          <p className="text-[13px] font-semibold font-mono truncate" style={{ color: '#1c1814' }}>{s.spec_name}</p>
+                          <p className="text-[11px] font-mono truncate" style={{ color: '#9c9088' }}>{s.table_name || '—'}</p>
+                        </div>
+                        {s.has_insight > 0 && (
+                          <span className="flex-shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded"
+                            style={{ color: '#16a34a', backgroundColor: '#f0fdf4' }}>
+                            has insight
+                          </span>
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </>
+            ) : (
+              <>
+                <p className="mb-3 text-xs leading-relaxed" style={{ color: '#9c9088' }}>
+                  Ask anything — the agent explores whichever tables (new features, the original
+                  funnel, or both) are actually relevant to your question, not just one spec's own
+                  PM questions. E.g. "why did checkout conversion drop last week" or "compare Express
+                  vs standard checkout across geos".
+                </p>
+                <textarea
+                  value={customPrompt}
+                  onChange={e => setCustomPrompt(e.target.value)}
+                  placeholder="What do you want to know?"
+                  rows={4}
+                  className="w-full rounded-xl border p-3 text-sm resize-none focus:outline-none focus:ring-2"
+                  style={{ borderColor: '#e5dfd6', color: '#1c1814' }}
+                />
+                <button
+                  onClick={() => { if (customPrompt.trim()) { setSpecName(customPrompt.trim().slice(0, 60)); setMode('folder-selected'); } }}
+                  disabled={!customPrompt.trim()}
+                  className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl py-2.5 text-sm font-semibold text-white transition-opacity hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed"
+                  style={{ backgroundColor: '#16a34a' }}>
+                  Continue
+                </button>
+              </>
             )}
           </div>
         )}
@@ -690,15 +755,21 @@ export function AgentPanel() {
         {mode === 'folder-selected' && panelMode === 'analytics' && (
           <div className="space-y-4 p-5">
             <div className="rounded-xl border p-4" style={{ borderColor: '#e5dfd6', backgroundColor: '#faf8f5' }}>
-              <p className="text-[10px] font-bold uppercase tracking-wider" style={{ color: '#9c9088' }}>Spec</p>
-              <p className="mt-1 text-sm font-semibold font-mono" style={{ color: '#1c1814' }}>{specName}</p>
+              <p className="text-[10px] font-bold uppercase tracking-wider" style={{ color: '#9c9088' }}>
+                {analyticsTab === 'custom' ? 'Question' : 'Spec'}
+              </p>
+              <p className="mt-1 text-sm font-semibold" style={{ color: '#1c1814' }}>
+                {analyticsTab === 'custom'
+                  ? <span className="font-normal">{customPrompt}</span>
+                  : <span className="font-mono">{specName}</span>}
+              </p>
             </div>
 
             <button
               onClick={() => setMode('idle')}
               className="w-full rounded-xl border py-2 text-xs transition-colors hover:bg-stone-50"
               style={{ borderColor: '#e5dfd6', color: '#7a7068' }}>
-              Choose a different spec
+              {analyticsTab === 'custom' ? 'Edit question' : 'Choose a different spec'}
             </button>
 
             <button

@@ -8,29 +8,35 @@ import type { SpecSummary } from '../api/specs/route';
 // Only two states matter to a reader scanning this list: is it still going,
 // or is it done. schema_proposals' real status enum (drafted/pending_review/
 // needs_rework/approved/executed/rejected) is per-revision pipeline
-// bookkeeping — genuinely useful inside a run's own trace, just noise here.
-function StatusDot({ status }: { status: string }) {
-  const completed = status === 'executed';
-  const color = completed ? '#16a34a' : '#2563eb';
+// bookkeeping -- genuinely useful inside a run's own trace, but NOT what
+// "is this still running" means: it's a snapshot of the last-written
+// revision's stage, which stays frozen at whatever it was when the process
+// stopped -- including a run that hit MAX_REVISIONS and gave up, or crashed,
+// which is finished but never reached "executed". Showing "Running" for any
+// non-executed status made every one of those look stuck in progress
+// forever, even hours after they'd actually ended. "Running" now means
+// exactly one thing: this spec is the one live-run-store currently has
+// active (see lib/live-run-store.ts) -- real-time truth, not a status enum.
+function StatusDot({ isLive }: { isLive: boolean }) {
+  const color = isLive ? '#2563eb' : '#16a34a';
   return (
     <span className="flex items-center gap-1.5 min-w-0">
       <span className="h-1.5 w-1.5 flex-shrink-0 rounded-full" style={{ backgroundColor: color }} />
       <span className="text-[11px] font-medium truncate" style={{ color: '#4a4540' }}>
-        {completed ? 'Completed' : 'Running'}
+        {isLive ? 'Running' : 'Completed'}
       </span>
     </span>
   );
 }
 
-// A proposal's confidence is self-reported by the proposer on its very first
-// draft, before review/rework/execution ever happen -- schema_proposals is
-// append-only, so `latest_confidence` reflects whatever the MOST RECENT
-// revision wrote, which can be a mid-flight draft. Showing it like a final
-// score while the spec is still `pending_review`/`needs_rework` reads as
-// more settled than it is -- only surface it once the run has actually
-// reached `executed`.
-function ConfidenceCell({ status, value }: { status: string; value: number }) {
-  if (status !== 'executed') return <span className="text-[11px] italic" style={{ color: '#c0b8b0' }}>in progress</span>;
+// A proposal's confidence is self-reported by the proposer on its most
+// recent revision -- while the run is genuinely still going, that number can
+// still change, so hide it. But a FINISHED run (whether it reached executed
+// or gave up after MAX_REVISIONS) has a real, settled last-known confidence
+// worth showing either way -- gating this on the status enum instead of
+// actual liveness hid it forever for any run that ended in needs_rework.
+function ConfidenceCell({ isLive, value }: { isLive: boolean; value: number }) {
+  if (isLive) return <span className="text-[11px] italic" style={{ color: '#c0b8b0' }}>in progress</span>;
   if (!value) return <span style={{ color: '#c0b8b0' }}>—</span>;
   const pct = Math.round(value * 100);
   const color = pct >= 80 ? '#16a34a' : pct >= 60 ? '#d97706' : '#dc2626';
@@ -50,14 +56,14 @@ function ConfidenceCell({ status, value }: { status: string; value: number }) {
 // manager or job queue, not a card grid).
 const GRID_COLS = '96px minmax(0,1.3fr) minmax(0,1fr) 84px 92px';
 
-function SpecRow({ spec }: { spec: SpecSummary }) {
+function SpecRow({ spec, isLive }: { spec: SpecSummary; isLive: boolean }) {
   return (
     <button
       onClick={() => openSpecHistory(spec.spec_name)}
       className="w-full grid items-center gap-4 px-4 py-2.5 text-left transition-colors hover:bg-stone-50 border-b last:border-0"
       style={{ gridTemplateColumns: GRID_COLS, borderColor: '#f0ece6' }}
     >
-      <StatusDot status={spec.latest_status} />
+      <StatusDot isLive={isLive} />
 
       <span className="text-[13px] font-semibold font-mono truncate" style={{ color: '#1c1814' }}>
         {spec.spec_name}
@@ -67,7 +73,7 @@ function SpecRow({ spec }: { spec: SpecSummary }) {
         {spec.table_name || '—'}
       </span>
 
-      <ConfidenceCell status={spec.latest_status} value={spec.latest_confidence} />
+      <ConfidenceCell isLive={isLive} value={spec.latest_confidence} />
 
       <span className="text-[11px] font-mono tabular-nums text-right" style={{ color: '#c0b8b0' }}>
         {spec.last_run.slice(5, 16).replace('T', ' ')}
@@ -79,6 +85,7 @@ function SpecRow({ spec }: { spec: SpecSummary }) {
 export default function SpecsPage() {
   const [specs,   setSpecs]   = useState<SpecSummary[]>([]);
   const [loading, setLoading] = useState(true);
+  const [liveSpecName, setLiveSpecName] = useState<string | null>(null);
 
   const refetch = () => {
     fetch('/api/specs')
@@ -97,11 +104,26 @@ export default function SpecsPage() {
 
   // If an ingestion is still running (e.g. this tab got reloaded mid-run),
   // reopen the panel automatically -- it reattaches to the live trace itself
-  // via lib/live-run-store.ts on mount.
+  // via lib/live-run-store.ts on mount. Also poll for which spec (if any) is
+  // ACTUALLY live right now, so each row's status reflects real-time truth
+  // instead of a frozen status enum (see StatusDot's comment) -- stops
+  // polling once nothing is active.
   useEffect(() => {
+    let timer: ReturnType<typeof setInterval> | null = null;
+    const poll = () => {
+      fetch('/api/live-run').then(r => r.json()).then(d => {
+        setLiveSpecName(d.active ? d.specName : null);
+        if (!d.active && timer) { clearInterval(timer); timer = null; }
+      }).catch(() => {});
+    };
     fetch('/api/live-run').then(r => r.json()).then(d => {
-      if (d.active) openAgentPanel();
+      if (d.active) {
+        openAgentPanel();
+        setLiveSpecName(d.specName);
+        timer = setInterval(poll, 3000);
+      }
     }).catch(() => {});
+    return () => { if (timer) clearInterval(timer); };
   }, []);
 
   return (
@@ -164,7 +186,7 @@ export default function SpecsPage() {
                 </span>
               ))}
             </div>
-            {specs.map(s => <SpecRow key={s.spec_name} spec={s} />)}
+            {specs.map(s => <SpecRow key={s.spec_name} spec={s} isLive={s.spec_name === liveSpecName} />)}
           </div>
         )}
       </div>

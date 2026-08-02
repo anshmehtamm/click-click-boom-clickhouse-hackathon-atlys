@@ -440,10 +440,14 @@ export function AgentPanel() {
               <span className="text-sm font-semibold font-mono truncate" style={{ color: '#1c1814' }}>
                 {historySpec}
               </span>
-              {historyMeta?.status && (
+              {!historyLoading && historyMeta && (
+                // Same fix as specs/page.tsx's StatusDot: "Running" means
+                // ACTUALLY live right now (historyIsLive, from live-run-store),
+                // never derived from the proposal status enum -- a finished
+                // run that ended in needs_rework/etc. is done, not stuck.
                 <span className="flex-shrink-0 text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded"
                   style={{ color: '#7a7068', backgroundColor: '#f0ece6' }}>
-                  {historyMeta.status === 'executed' ? 'Completed' : 'Running'}
+                  {historyIsLive ? 'Running' : 'Completed'}
                 </span>
               )}
             </>

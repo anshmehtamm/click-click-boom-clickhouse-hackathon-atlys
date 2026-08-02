@@ -57,28 +57,52 @@ def _stringify(v) -> str:
     return v if isinstance(v, str) else json.dumps(v, default=str)
 
 
+_TRACE_EVENTS_COLS = ["ts", "trace_id", "trace_url", "agent", "spec_name", "step",
+                      "event", "kind", "input", "output", "reasoning", "usage", "metadata"]
+
+# Flush periodically DURING a run, not only once at the very end. Found the
+# hard way: two real runs that both ended in an exception (exhausted rework
+# revisions) have ZERO persisted trace_events despite genuinely running for
+# 10+ minutes each -- the single end-of-run bulk insert is all-or-nothing, so
+# if it fails for ANY reason (or the process is killed hard enough to skip
+# Python's `finally`), the ENTIRE trace is lost, not just the tail. Flushing
+# every _FLUSH_BATCH_SIZE events caps how much a single failure can cost.
+_FLUSH_BATCH_SIZE = 25
+
+
+def _rows_from_events(events: list[dict]) -> list[list]:
+    return [[
+        datetime.fromtimestamp(e.get("ts", time.time()), tz=timezone.utc),
+        e.get("trace_id", ""), e.get("trace_url", ""), e.get("agent", ""),
+        e.get("spec", ""), e.get("step", ""), e.get("event", ""), e.get("kind", ""),
+        _stringify(e.get("input")), _stringify(e.get("output")),
+        e.get("reasoning") or "", _stringify(e.get("usage")), _stringify(e.get("metadata")),
+    ] for e in events]
+
+
 def _flush_trace_events(events: list[dict]) -> None:
-    """One bulk INSERT for the whole trace at traced_run()'s end, not one
-    INSERT per event -- a run emits dozens of events, and per-event inserts
-    against ClickHouse are exactly the anti-pattern this pipeline itself flags
-    to the proposer. Best-effort: a failure here must never take down the
-    pipeline run that already completed successfully."""
+    """Bulk INSERT for a batch of events -- one INSERT per BATCH, not per
+    event (per-event inserts against ClickHouse are exactly the anti-pattern
+    this pipeline itself flags to the proposer). Best-effort: a failure here
+    must never take down the pipeline run itself. Falls back to one-row-at-a-
+    time on a bulk failure so a single malformed event doesn't sink the whole
+    batch -- confirmed a 300-row synthetic batch inserts cleanly in the common
+    case, so this fallback is specifically for the rare bad-row scenario."""
     if not events:
         return
     try:
         client = get_ch_client(database="agent_meta")
-        cols = ["ts", "trace_id", "trace_url", "agent", "spec_name", "step",
-                "event", "kind", "input", "output", "reasoning", "usage", "metadata"]
-        rows = [[
-            datetime.fromtimestamp(e.get("ts", time.time()), tz=timezone.utc),
-            e.get("trace_id", ""), e.get("trace_url", ""), e.get("agent", ""),
-            e.get("spec", ""), e.get("step", ""), e.get("event", ""), e.get("kind", ""),
-            _stringify(e.get("input")), _stringify(e.get("output")),
-            e.get("reasoning") or "", _stringify(e.get("usage")), _stringify(e.get("metadata")),
-        ] for e in events]
-        client.insert("trace_events", rows, column_names=cols)
+        client.insert("trace_events", _rows_from_events(events), column_names=_TRACE_EVENTS_COLS)
     except Exception:
-        logging.getLogger(__name__).exception("failed to persist trace_events (non-fatal)")
+        logging.getLogger(__name__).warning(
+            "bulk trace_events insert failed for %d rows, falling back to per-row", len(events), exc_info=True,
+        )
+        client = get_ch_client(database="agent_meta")
+        for row in _rows_from_events(events):
+            try:
+                client.insert("trace_events", [row], column_names=_TRACE_EVENTS_COLS)
+            except Exception:
+                logging.getLogger(__name__).exception("failed to persist one trace_event row (skipped)")
 
 
 def _step_kind(step: str) -> str:
@@ -105,7 +129,8 @@ class Run:
         self._root_span = root_span
         self.agent = agent
         self.spec = spec
-        self._events: list[dict] = []  # flushed to agent_meta.trace_events by traced_run()
+        self._events: list[dict] = []  # ALL events this run has emitted so far
+        self._flushed_count = 0  # how many of _events are already durably in trace_events
 
     @property
     def trace_id(self) -> str:
@@ -114,6 +139,17 @@ class Run:
     @property
     def url(self) -> str:
         return self._client.get_trace_url(trace_id=self._root_span.trace_id)
+
+    def _record(self, event: dict) -> None:
+        """Buffer one event and flush every _FLUSH_BATCH_SIZE, instead of only
+        at traced_run()'s very end -- see _flush_trace_events' docstring for
+        why (two real runs lost their entire trace to a single end-of-run
+        flush that never landed)."""
+        self._events.append(event)
+        pending = len(self._events) - self._flushed_count
+        if pending >= _FLUSH_BATCH_SIZE:
+            _flush_trace_events(self._events[self._flushed_count:])
+            self._flushed_count = len(self._events)
 
     def log(self, step: str, input=None, output=None, reasoning: str = None, usage: dict = None, **metadata):
         """One-shot child span for a single call/decision with no sub-steps of its own."""
@@ -150,7 +186,7 @@ class Run:
             "ts": time.time(),
         }
         emit_event(event)
-        self._events.append(event)
+        self._record(event)
 
         # Use "generation" type if usage data is provided (LLM call), otherwise "span"
         observation_type = "generation" if usage else "span"
@@ -189,7 +225,7 @@ class Run:
             "step": name, "metadata": metadata, "ts": time.time(),
         }
         emit_event(span_start_event)
-        self._events.append(span_start_event)
+        self._record(span_start_event)
 
         with self._client.start_as_current_observation(
             name=name, as_type="span", metadata=metadata or None
@@ -212,7 +248,7 @@ class Run:
                     "step": name, "metadata": metadata, "ts": time.time(),
                 }
                 emit_event(span_end_event)
-                self._events.append(span_end_event)
+                self._record(span_end_event)
 
 
 @contextlib.contextmanager
@@ -256,7 +292,7 @@ def traced_run(agent: str, spec: str, **extra_tags):
                 "agent": agent, "spec": spec, "metadata": extra_tags, "ts": time.time(),
             }
             emit_event(trace_start_event)
-            run._events.append(trace_start_event)
+            run._record(trace_start_event)
 
             try:
                 yield run
@@ -277,6 +313,6 @@ def traced_run(agent: str, spec: str, **extra_tags):
                     "agent": agent, "spec": spec, "metadata": extra_tags, "ts": time.time(),
                 }
                 emit_event(trace_end_event)
-                run._events.append(trace_end_event)
-                _flush_trace_events(run._events)
+                run._events.append(trace_end_event)  # append only -- flush below covers it, don't double-count via _record
+                _flush_trace_events(run._events[run._flushed_count:])
                 client.flush()

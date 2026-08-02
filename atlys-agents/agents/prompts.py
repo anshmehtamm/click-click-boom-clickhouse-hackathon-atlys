@@ -561,33 +561,107 @@ Confidence — state 2-3 named drivers:
   <0.5: n < 30 per segment, directional only, or unexplained
   NEVER report >0.85 when any key segment has n < 30.
 
-── STAGE 5: WRITE THE REPORT AS A SELF-CONTAINED HTML PAGE ─────────────────
+── STAGE 5: WRITE THE REPORT FOR A PM, NOT FOR AN ENGINEER ──────────────────
+Everything above (Stages 1-4) is YOUR working process — rigorous, technical, full
+of table names, SQL, and stats vocabulary. `report_html` is a completely different
+artifact: what a Product Manager reads to decide what to DO next. A PM has never
+heard of ClickHouse, doesn't know what a "small-n gate" is, and does not care what
+column you joined on. If the report contains a table name, a SQL snippet, a
+"n=" stat, a Kx issue code, or the words "query"/"join"/"aggregate"/"gate", you have
+failed this stage — go back and translate it into plain business language.
+
+The test for every sentence you write: **would a PM know what to DO after reading
+this, and why it's true?** "What" without "why" is not an insight — it's a stat.
+"Checkout abandonment rose 12%" is not an insight. "Users abandon checkout because
+the OTP screen doesn't show on older Android devices, costing an estimated $Xk/week
+in Gulf markets — worth a fast-follow fix" IS an insight: what happened, why it's
+happening (the mechanism, in plain terms — a UX/product cause, not a database
+artifact), who it affects, and what to do about it.
+
+KEEP IT SHORT. This is a one-screen memo, not a document — a PM should be able to
+read the whole thing in under a minute. Hard limits: 2-4 findings MAX (pick the
+ones that actually matter; drop anything marginal rather than padding the report
+to look thorough), one screen-width `<div style="max-width:640px;margin:0 auto">`
+wrapper, no finding longer than ~4 sentences, no repeating the same number in two
+different sections.
+
 `report_html` is a complete, standalone HTML document — inline `<style>` only, no
-external CSS/JS/images/fonts (it will be served as-is with no other assets
-available). Structure it as:
-  1. `<h1>` title + one-paragraph executive summary up top.
-  2. One `<section>` per PM question from the spec: the question as a heading, the
-     actual SQL you ran, a real `<table>` of the result rows, and 1-3 sentences of
-     interpretation directly under it. Every number in the interpretation must be
-     traceable to the table above it — no numbers that didn't come from a query
-     you actually ran.
-  3. A segment-cuts section if you found a real skew (device/geo/destination),
-     rendered as a `<table>` — not a described-but-not-shown claim.
-  4. A "Known issues" section listing any Kx correlations with their matching
-     criteria.
-  5. A closing "Confidence & caveats" section: the stated confidence, its drivers,
-     and anything structurally uncomputable (say so plainly, never fabricate a
-     number to fill a gap).
-For simple bar-style comparisons, a plain CSS width-percentage bar
-(`<div style="width:NN%;background:#...;height:10px"></div>`) next to the number
-is enough — don't attempt anything requiring JS or an external charting library.
-Keep the visual design clean and legible (a real max-width, readable font stack,
-enough padding) but simple — this is a report, not a marketing page.
+external CSS/JS/images/fonts (served as-is with no other assets available).
+Structure it as:
+  1. A header band: `<h1>` title (the finding + its cause, not a generic label) and
+     directly under it, in a lighter/muted style, the one-paragraph executive
+     summary — what's happening, why, and the headline recommendation, in that
+     order, in plain English.
+  2. One compact `<section>` (styled as a card: subtle border or background tint,
+     rounded corners, generous padding) per finding — 2-4 total, most important
+     first. Group related PM questions into one finding if they tell the same
+     story; do not force one section per question. Each card gets:
+       - a bold plain-language heading naming the finding, not the question
+       - ONE headline number, made visually prominent (large font-size, e.g.
+         28-36px, a single accent color) — the single most important stat for
+         this finding, stated in business terms (a rate, a rough revenue/user
+         impact, a comparison to baseline), not a table of numbers
+       - 2-4 sentences: what we found, and the WHY (the product/behavioral
+         mechanism — a segment, a device, a step in the flow, a timing pattern —
+         never "the data showed X" with no explanation)
+       - a short "→ Recommended action:" line in a distinct visual treatment
+         (e.g. a colored left border or a tinted inline box) so it's scannable
+         separate from the explanation
+     A simple CSS width-percentage bar is fine for a quick visual comparison
+     (`<div style="width:NN%;background:#...;height:8px;border-radius:4px"></div>`);
+     never include raw SQL or a dump of query result rows — pull out only the one
+     number that supports the sentence next to it.
+  3. If confidence is genuinely limited on a finding, fold it into that finding's
+     own text as ONE plain clause (e.g. "based on the first two weeks of usage" or
+     "seen in a small number of users so far, an early signal not a certainty") —
+     never a separate "Confidence & caveats" section, and never statistical
+     reasoning, drivers, or gate terminology anywhere in the document.
+  4. No separate "what to do next" list distinct from the per-finding recommended
+     actions above — that's the whole point of putting the action inside each
+     card. Do not add a summary table, appendix, or methodology section.
+
+Visual design: a real, modern typography scale (system font stack, e.g.
+`-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif` — larger/bolder for the
+title and headline numbers, smaller and muted (`#6b7280` or similar) for supporting
+text), one accent color used consistently for headline numbers and the
+recommended-action treatment, generous whitespace between cards (not walls of
+text touching the edges), and a light neutral page background (e.g. `#fafafa`)
+behind white/tinted cards so sections read as distinct, legible blocks at a
+glance — not a marketing page, not a wall of engineering-report prose either.
+
+Use this `<style>` block as your actual starting point — adapt the accent color
+and copy where it helps the specific finding, but keep the same structure and
+restraint (this is a one-screen memo, not a marketing page):
+```html
+<style>
+  body {{ margin:0; padding:32px 16px; background:#fafafa;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:#1f2937; }}
+  .wrap {{ max-width:640px; margin:0 auto; }}
+  h1 {{ font-size:22px; font-weight:700; line-height:1.35; margin:0 0 8px; color:#111827; }}
+  .summary {{ font-size:14.5px; line-height:1.6; color:#6b7280; margin:0 0 28px; }}
+  .card {{ background:#fff; border:1px solid #e5e7eb; border-radius:14px;
+    padding:22px 24px; margin-bottom:16px; box-shadow:0 1px 2px rgba(0,0,0,0.03); }}
+  .card h2 {{ font-size:15.5px; font-weight:650; margin:0 0 10px; color:#111827; }}
+  .headline {{ font-size:32px; font-weight:750; color:#2563eb; line-height:1;
+    margin:2px 0 12px; }}
+  .card p {{ font-size:13.5px; line-height:1.65; color:#374151; margin:0 0 10px; }}
+  .bar {{ height:8px; border-radius:4px; background:#e5e7eb; overflow:hidden; margin:10px 0 14px; }}
+  .bar > div {{ height:100%; background:#2563eb; border-radius:4px; }}
+  .action {{ border-left:3px solid #2563eb; background:#eff6ff; padding:10px 14px;
+    border-radius:0 8px 8px 0; font-size:13.5px; color:#1e3a8a; margin-top:12px; }}
+  .action strong {{ color:#1e40af; }}
+</style>
+```
+One accent color throughout (swap `#2563eb` for whatever fits the finding — a
+single consistent hex used for `.headline`, `.bar > div`, and `.action`'s
+border/background, not a different color per card). This is a starting point,
+not a rigid template — vary it where the content genuinely calls for it, but
+don't drop below this level of polish.
 
 Output ONLY this JSON (no markdown fences, no prose outside):
 {{
-  "title": "short PM-ready headline: what changed and for which segment",
-  "summary": "2-5 sentences, same content as the report's executive summary — this is what a list view shows before anyone opens the full report.",
+  "title": "short PM-ready headline naming the finding AND its cause — e.g. 'Forex add-on adoption is low among Android users because the rate-lock timer isn't visible on smaller screens', not 'Forex adoption analysis'",
+  "summary": "2-5 sentences in plain business language: what's happening, why (the mechanism/cause), who it affects, and the headline recommendation. This is what a list view shows before anyone opens the full report — it must stand alone as a PM-readable insight, not a teaser for technical detail inside.",
   "segment_cuts": ["device_type", "geoip_country_code"],
   "related_known_issues": [
     {{
@@ -597,8 +671,8 @@ Output ONLY this JSON (no markdown fences, no prose outside):
     }}
   ],
   "confidence": 0.0,
-  "confidence_drivers": "e.g. n_ios=8 (low), effect=large, K1 confirmed all axes",
-  "report_html": "<!doctype html><html>...full standalone page as described above..."
+  "confidence_drivers": "internal-only, e.g. n_ios=8 (low), effect=large, K1 confirmed all axes -- for the trace/dashboard, never copied into report_html",
+  "report_html": "<!doctype html><html>...full standalone page as described above, written entirely for a PM..."
 }}
 """.strip()
 

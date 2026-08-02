@@ -91,6 +91,23 @@ CREATE TABLE IF NOT EXISTS agent_meta.insights
 ENGINE = MergeTree
 ORDER BY (spec_name, ts);
 
+-- The spec's own spec.md, captured at ingest time. Nothing else durably
+-- stores this today -- ingest_spec() only ever received it as an in-memory
+-- argument. Needed so the analytics agent can be triggered as an explicit,
+-- LATER step (from the dashboard's "Create Insight" button) against a spec
+-- that finished ingesting in some earlier process -- without it, there's no
+-- way to hand the analytics agent the spec_markdown it needs. Append-only
+-- like every other agent_meta table; argMax(spec_markdown, ts) gets the
+-- latest if a spec is ever re-ingested.
+CREATE TABLE IF NOT EXISTS agent_meta.spec_sources
+(
+    ts DateTime DEFAULT now(),
+    spec_name String,
+    spec_markdown String
+)
+ENGINE = MergeTree
+ORDER BY (spec_name, ts);
+
 CREATE TABLE IF NOT EXISTS agent_meta.context_versions
 (
     version_id UUID,

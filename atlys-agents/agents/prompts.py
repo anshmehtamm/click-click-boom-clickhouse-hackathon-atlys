@@ -459,6 +459,20 @@ Produce one or more new sections:
   previously-uncomputable metric computable, or defines a genuinely new metric implied
   by the spec's PM questions. Don't invent metrics not implied by the spec.
 
+Then check for STALENESS in what's already recorded — this table landing can make an
+existing `entity:*`, `issue:K*`, `dataquality:*`, or `convention:*` section wrong or
+outdated even though nothing above required you to touch it. From the sections
+list_context_sections returned, scan titles/summaries for anything this table's grain,
+join_keys, or column_mapping directly bears on (e.g. a `dataquality:*` claim about an
+entity's cardinality, an `issue:K*` whose criteria this table's data could confirm or
+contradict, an `entity:*` definition this table's columns narrow or extend). For each
+one that's now actually wrong or materially incomplete — not just "related" — write an
+updated version with `before` set to its real prior content and `diff_summary`
+explaining exactly what changed and why this table is the evidence. Don't touch a
+section just because it's topically adjacent; only update ones you can point to a
+specific contradiction or gap in, backed by this proposal. If nothing existing is
+actually stale, don't manufacture an update — just emit nothing for this part.
+
 For each section, set `before` to the prior content you actually fetched via
 lookup_context if the section already existed, else "".
 

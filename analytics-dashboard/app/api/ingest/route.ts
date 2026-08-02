@@ -136,7 +136,7 @@ except Exception as e:
         fs.writeFileSync(tmpScriptPath, pythonScript);
 
         sendEvent({ type: 'log', stage: 'init', message: '🚀 Initializing pipeline...' });
-        startRun(specName);
+        startRun(specName, 'ingest');
 
         const agentsDir = path.join(process.cwd(), '../atlys-agents');
         const venvPython = path.join(agentsDir, '.venv/bin/python');

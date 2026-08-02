@@ -32,6 +32,7 @@ import os
 import uuid
 
 from agent_meta.db import get_client
+from tracing import traced_run
 
 # Import shared agent helpers from their own module to avoid a circular import
 # (pipeline.py lazily imports analytics_agent; analytics_agent must not import
@@ -152,3 +153,74 @@ def run_analytics(run, spec_name: str, table_name: str, spec_markdown: str,
     analysis["insight_id"] = insight_id
     analysis["trace_url"] = run.url
     return analysis
+
+
+def _latest_executed_table(meta_client, spec_name: str) -> str | None:
+    """The table this spec landed as, IF its most recent proposal actually
+    reached 'executed' -- the same gate the dashboard's "Create Insight"
+    button enforces client-side (only executed specs are selectable), checked
+    again here since this is the real authority: a proposal that's
+    needs_rework/rejected/still mid-pipeline has no real table to analyze."""
+    rows = meta_client.query(
+        "SELECT argMax(table_name, ts) AS table_name, argMax(status, ts) AS status "
+        "FROM agent_meta.schema_proposals WHERE spec_name = %(spec)s GROUP BY spec_name",
+        parameters={"spec": spec_name},
+    ).result_rows
+    if not rows or rows[0][1] != "executed":
+        return None
+    return rows[0][0]
+
+
+def _latest_spec_markdown(meta_client, spec_name: str) -> str | None:
+    rows = meta_client.query(
+        "SELECT argMax(spec_markdown, ts) AS spec_markdown "
+        "FROM agent_meta.spec_sources WHERE spec_name = %(spec)s GROUP BY spec_name",
+        parameters={"spec": spec_name},
+    ).result_rows
+    return rows[0][0] if rows and rows[0][0] else None
+
+
+def run_analytics_for_spec(spec_name: str) -> dict:
+    """Explicit, dashboard-triggered entry point -- the counterpart to
+    orchestrator.ingest_spec for the analytics half of the pipeline, now that
+    executing a schema no longer implicitly runs analytics (see
+    orchestrator/pipeline.py's ingest_spec docstring). Looks up the spec's
+    latest EXECUTED table and its persisted spec_markdown (agent_meta.spec_sources
+    -- written by ingest_spec, see the same file), opens its own traced_run
+    (this is a separate step now, not nested inside the ingest trace), and runs
+    the same analytics loop as run_analytics(). Returns a summary dict shaped
+    like ingest_spec()'s return value so the dashboard's live-run panel can
+    treat both the same way.
+    """
+    meta_client = get_client(database="agent_meta")
+
+    table_name = _latest_executed_table(meta_client, spec_name)
+    if not table_name:
+        return {
+            "status": "failed",
+            "error": f"Spec '{spec_name}' has no executed proposal — schema must be executed before analytics can run.",
+        }
+
+    spec_markdown = _latest_spec_markdown(meta_client, spec_name)
+    if not spec_markdown:
+        return {
+            "status": "failed",
+            "error": f"No stored spec markdown for '{spec_name}' — re-run ingestion to capture it (older runs predate spec_sources).",
+        }
+
+    with traced_run(agent="analytics", spec=spec_name) as run:
+        analysis = run_analytics(run, spec_name, table_name, spec_markdown, meta_client)
+        if analysis is None:
+            return {
+                "status": "failed",
+                "error": "Analytics agent did not produce a usable result (not configured, or output couldn't be parsed) — check the trace.",
+                "trace_url": run.url,
+            }
+        return {
+            "status": "completed",
+            "insight_id": analysis.get("insight_id"),
+            "title": analysis.get("title"),
+            "confidence": analysis.get("confidence"),
+            "table_name": table_name,
+            "trace_url": analysis.get("trace_url", run.url),
+        }

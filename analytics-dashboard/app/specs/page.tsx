@@ -102,22 +102,32 @@ export default function SpecsPage() {
     return () => window.removeEventListener('specs-updated', refetch);
   }, []);
 
-  // If an ingestion is still running (e.g. this tab got reloaded mid-run),
+  // If an INGESTION is still running (e.g. this tab got reloaded mid-run),
   // reopen the panel automatically -- it reattaches to the live trace itself
   // via lib/live-run-store.ts on mount. Also poll for which spec (if any) is
   // ACTUALLY live right now, so each row's status reflects real-time truth
   // instead of a frozen status enum (see StatusDot's comment) -- stops
   // polling once nothing is active.
+  //
+  // Scoped to kind === 'ingest' specifically -- live-run-store's single slot
+  // is shared with analytics runs (/api/analytics, see lib/live-run-store.ts's
+  // `kind` docstring). Without this check, triggering analytics on a spec
+  // (only possible once it's already 'executed', i.e. NOT actually running)
+  // made this page auto-open the ingest panel and mark that row "Running" for
+  // a pipeline that was never running -- the ingest panel then reattached to
+  // nothing (its own reconnect effect correctly requires kind === 'ingest'
+  // too), leaving an auto-opened panel stuck showing "New Spec" idle while
+  // the real analytics run was active elsewhere.
   useEffect(() => {
     let timer: ReturnType<typeof setInterval> | null = null;
     const poll = () => {
       fetch('/api/live-run').then(r => r.json()).then(d => {
-        setLiveSpecName(d.active ? d.specName : null);
-        if (!d.active && timer) { clearInterval(timer); timer = null; }
+        setLiveSpecName(d.active && d.kind === 'ingest' ? d.specName : null);
+        if (!(d.active && d.kind === 'ingest') && timer) { clearInterval(timer); timer = null; }
       }).catch(() => {});
     };
     fetch('/api/live-run').then(r => r.json()).then(d => {
-      if (d.active) {
+      if (d.active && d.kind === 'ingest') {
         openAgentPanel();
         setLiveSpecName(d.specName);
         timer = setInterval(poll, 3000);

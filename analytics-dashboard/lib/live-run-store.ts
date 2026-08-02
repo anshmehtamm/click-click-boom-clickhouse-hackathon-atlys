@@ -13,9 +13,21 @@
 // Single in-memory object, not a queue-per-run: this pipeline is used
 // interactively, one ingestion at a time, from one dev server process --
 // no need for multi-run tracking or cross-process persistence.
+//
+// `kind` distinguishes an ingestion run (/api/ingest, agent='pipeline':
+// propose/review/execute) from an analytics run (/api/analytics,
+// agent='analytics') sharing this same slot. Without it, agent-panel.tsx's
+// history-mode reconnect check only compared specName -- and since analytics
+// can only be triggered on a spec that's already 'executed' (i.e. a
+// COMPLETED spec), starting an analytics run for spec X and then clicking
+// spec X in the specs list made history mode believe X's ingestion pipeline
+// was live, showing the analytics agent's live trace instead.
+
+export type LiveRunKind = 'ingest' | 'analytics';
 
 export interface LiveRunSnapshot {
   specName: string | null;
+  kind: LiveRunKind | null;
   active: boolean;
   startedAt: number | null;
   events: Record<string, any>[]; // raw trace_event payloads, same shape /api/ingest forwards
@@ -23,11 +35,11 @@ export interface LiveRunSnapshot {
 }
 
 let state: LiveRunSnapshot = {
-  specName: null, active: false, startedAt: null, events: [], result: null,
+  specName: null, kind: null, active: false, startedAt: null, events: [], result: null,
 };
 
-export function startRun(specName: string): void {
-  state = { specName, active: true, startedAt: Date.now(), events: [], result: null };
+export function startRun(specName: string, kind: LiveRunKind = 'ingest'): void {
+  state = { specName, kind, active: true, startedAt: Date.now(), events: [], result: null };
 }
 
 export function pushRawEvent(event: Record<string, any>): void {

@@ -26,28 +26,42 @@ export interface TraceEventRow {
 
 export const dynamic = 'force-dynamic';
 
+// Counterpart to /api/specs/[name]/events, but keyed by insight_id rather than
+// spec_name -- a spec can now have MULTIPLE insights (analytics is an
+// explicit, re-runnable step, see analytics/analytics_agent.py's
+// run_analytics_for_spec), so "the latest trace for this spec" is no longer
+// enough to find one specific insight's own trace. insights doesn't store
+// trace_id directly, only trace_url (the same value every event on that trace
+// carries) -- used here as the join key back into trace_events instead of
+// adding a column.
 export async function GET(
   _req: NextRequest,
-  { params }: { params: Promise<{ name: string }> }
+  { params }: { params: Promise<{ id: string }> }
 ) {
-  const { name: spec } = await params;
+  const { id } = await params;
   try {
-    // "How was this spec most recently INGESTED" -- scoped to agent='pipeline'
-    // specifically, not just the latest trace_id for this spec_name overall.
-    // analytics_agent.run_analytics_for_spec (the dashboard's "Create Insight"
-    // button) now opens its OWN traced_run(agent="analytics", ...) as a
-    // separate, later, explicit step (see orchestrator/pipeline.py's
-    // ingest_spec docstring) -- without this filter, running analytics on a
-    // spec made its analytics trace the newest one for that spec_name, which
-    // silently replaced the ingestion trace (propose/review/execute) in the
-    // Specs list's history panel with the unrelated analytics trace instead.
+    const insightRes = await client.query({
+      query: `
+        SELECT trace_url FROM agent_meta.insights
+        WHERE insight_id = {id:String}
+        ORDER BY ts DESC LIMIT 1
+      `,
+      query_params: { id },
+      format: 'JSONEachRow',
+    });
+    const insightRows = await insightRes.json<{ trace_url: string }>();
+    const traceUrl = insightRows[0]?.trace_url;
+    if (!traceUrl) {
+      return NextResponse.json({ trace_id: null, events: [] });
+    }
+
     const latest = await client.query({
       query: `
         SELECT trace_id FROM agent_meta.trace_events
-        WHERE spec_name = {spec:String} AND agent = 'pipeline'
+        WHERE trace_url = {traceUrl:String}
         ORDER BY ts DESC LIMIT 1
       `,
-      query_params: { spec },
+      query_params: { traceUrl },
       format: 'JSONEachRow',
     });
     const latestRows = await latest.json<{ trace_id: string }>();

@@ -147,21 +147,28 @@ function LogRow({ entry }: { entry: LogEntry }) {
 // ── main panel ────────────────────────────────────────────────────────────────
 
 export function AgentPanel() {
-  const { close, mode: panelMode, historySpec, analyticsSpec } = usePanelCtx();
+  const { close, mode: panelMode, historySpec, historyInsight, analyticsSpec } = usePanelCtx();
 
   // ── history mode: the real persisted trace (agent_meta.trace_events) for
-  // how this spec was most recently ingested, same events/widgets as a live
-  // run — plus /runs just for the small status badge in the header (not the
-  // trace content itself, which now comes from real events).
+  // EITHER how a spec was most recently ingested (historySpec — propose/
+  // review/execute, agent='pipeline') OR one specific insight's own analytics
+  // run (historyInsight — agent='analytics'). A spec can have several
+  // insights now that analytics is an explicit, re-runnable step (see
+  // lib/panel-context.tsx's HistoryInsightTarget), so "this spec's trace"
+  // isn't specific enough once you're looking at one particular insight —
+  // hence the separate endpoint keyed by insight_id
+  // (/api/insights/[id]/events) rather than spec_name.
   //
-  // Gap this closes: clicking a spec row always opened history mode, which
-  // only ever looked at trace_events -- but that table is only populated by
-  // ONE bulk insert at traced_run()'s END (see lib/live-run-store.ts's
-  // docstring for why). If you reload and click the spec that's STILL
-  // running, history mode found nothing there yet and showed "no persisted
-  // trace", even though the run was actively producing a real trace this
-  // whole time. Check live-run-store FIRST for this exact spec; only fall
-  // back to the persisted fetch if it isn't the one currently in flight.
+  // Gap this closes for historySpec (the original case): clicking a spec row
+  // always opened history mode, which only ever looked at trace_events -- but
+  // that table is only populated by ONE bulk insert at traced_run()'s END
+  // (see lib/live-run-store.ts's docstring for why). If you reload and click
+  // the spec that's STILL running, history mode found nothing there yet and
+  // showed "no persisted trace", even though the run was actively producing a
+  // real trace this whole time. Check live-run-store FIRST for this exact
+  // spec; only fall back to the persisted fetch if it isn't the one currently
+  // in flight. (historyInsight skips this reconnect path entirely — a past
+  // insight's trace is always a finished, persisted run.)
   const [historyEvents, setHistoryEvents]   = useState<AgentEvent[]>([]);
   const [historyMeta,   setHistoryMeta]     = useState<{ status?: string } | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -169,11 +176,20 @@ export function AgentPanel() {
   const [historyIsLive,  setHistoryIsLive]  = useState(false);
 
   useEffect(() => {
-    if (panelMode !== 'history' || !historySpec) return;
+    if (panelMode !== 'history' || (!historySpec && !historyInsight)) return;
     let pollTimer: ReturnType<typeof setInterval> | null = null;
     setHistoryLoading(true);
     setHistoryError(null);
     setHistoryIsLive(false);
+
+    if (historyInsight) {
+      fetch(`/api/insights/${historyInsight.insightId}/events`)
+        .then(r => r.json())
+        .then(eventsRes => setHistoryEvents((eventsRes.events ?? []).map(normalizeTraceEvent)))
+        .catch(e => setHistoryError(String(e)))
+        .finally(() => setHistoryLoading(false));
+      return;
+    }
 
     const loadPersisted = () => {
       Promise.all([
@@ -190,7 +206,7 @@ export function AgentPanel() {
 
     const pollLive = () => {
       fetch('/api/live-run').then(r => r.json()).then(d => {
-        if (d.specName !== historySpec) return; // a different spec started while we were watching
+        if (d.specName !== historySpec || d.kind !== 'ingest') return; // a different spec, or an analytics run for this spec, started while we were watching
         setHistoryEvents(d.events.map(normalizeTraceEvent));
         if (!d.active) {
           if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
@@ -200,8 +216,11 @@ export function AgentPanel() {
       }).catch(() => {});
     };
 
+    // historySpec always means "this spec's ingestion trace" -- an in-flight
+    // analytics run for this same (already-executed) spec shares the store's
+    // specName but must never be shown here (see live-run-store.ts's kind doc).
     fetch('/api/live-run').then(r => r.json()).then(d => {
-      if (d.active && d.specName === historySpec) {
+      if (d.active && d.specName === historySpec && d.kind === 'ingest') {
         setHistoryIsLive(true);
         setHistoryLoading(false);
         setHistoryEvents(d.events.map(normalizeTraceEvent));
@@ -213,7 +232,7 @@ export function AgentPanel() {
     }).catch(loadPersisted);
 
     return () => { if (pollTimer) clearInterval(pollTimer); };
-  }, [panelMode, historySpec]);
+  }, [panelMode, historySpec, historyInsight]);
 
   const [mode,     setMode]     = useState<Mode>('idle');
   const [specName, setSpecName] = useState('');
@@ -276,8 +295,9 @@ export function AgentPanel() {
     // stale result (the store keeps the last result around only so a reload
     // during the trailing "Done" screen doesn't lose it, not so the NEXT
     // unrelated panel open inherits it).
-    const applySnapshot = (data: { specName: string | null; active: boolean; events: any[]; result: any }): boolean => {
-      if (!data.active || !data.specName) return false;
+    const expectedKind = panelMode === 'analytics' ? 'analytics' : 'ingest';
+    const applySnapshot = (data: { specName: string | null; kind: string | null; active: boolean; events: any[]; result: any }): boolean => {
+      if (!data.active || !data.specName || data.kind !== expectedKind) return false;
       setSpecName(data.specName);
       setTraceEvents(data.events.map(normalizeTraceEvent));
       setMode('running');
@@ -502,11 +522,22 @@ export function AgentPanel() {
           {panelMode === 'history' ? (
             <>
               {(historyLoading || historyIsLive) && <Loader2 className="h-4 w-4 animate-spin text-blue-500 flex-shrink-0" />}
-              {!historyLoading && !historyIsLive && <FolderOpen className="h-4 w-4 flex-shrink-0" style={{ color: '#9c9088' }} />}
-              <span className="text-sm font-semibold font-mono truncate" style={{ color: '#1c1814' }}>
-                {historySpec}
+              {!historyLoading && !historyIsLive && (
+                historyInsight
+                  ? <LineChart className="h-4 w-4 flex-shrink-0" style={{ color: '#9c9088' }} />
+                  : <FolderOpen className="h-4 w-4 flex-shrink-0" style={{ color: '#9c9088' }} />
+              )}
+              <span className="text-sm font-semibold truncate" style={{ color: '#1c1814' }}>
+                {historyInsight ? (historyInsight.title || 'Insight trace') : (
+                  <span className="font-mono">{historySpec}</span>
+                )}
               </span>
-              {!historyLoading && historyMeta && (
+              {historyInsight?.specName && (
+                <span className="flex-shrink-0 text-[10px] font-mono truncate max-w-[120px]" style={{ color: '#c0b8b0' }}>
+                  {historyInsight.specName}
+                </span>
+              )}
+              {!historyLoading && !historyInsight && historyMeta && (
                 // Same fix as specs/page.tsx's StatusDot: "Running" means
                 // ACTUALLY live right now (historyIsLive, from live-run-store),
                 // never derived from the proposal status enum -- a finished
@@ -522,11 +553,15 @@ export function AgentPanel() {
               {mode === 'running' && <Loader2 className="h-4 w-4 animate-spin text-blue-500" />}
               {mode === 'done' && success   && <CheckCircle className="h-4 w-4 text-green-600" />}
               {mode === 'done' && !success  && <XCircle className="h-4 w-4 text-red-500" />}
-              {(mode === 'idle' || mode === 'folder-selected') && <FolderOpen className="h-4 w-4" style={{ color: '#9c9088' }} />}
+              {(mode === 'idle' || mode === 'folder-selected') && (
+                panelMode === 'analytics'
+                  ? <LineChart className="h-4 w-4" style={{ color: '#9c9088' }} />
+                  : <FolderOpen className="h-4 w-4" style={{ color: '#9c9088' }} />
+              )}
               <span className="text-sm font-semibold" style={{ color: '#1c1814' }}>
-                {mode === 'idle' && 'New Spec'}
+                {mode === 'idle' && (panelMode === 'analytics' ? 'Create Insight' : 'New Spec')}
                 {mode === 'folder-selected' && specName}
-                {mode === 'running' && `Running ${specName}…`}
+                {mode === 'running' && (panelMode === 'analytics' ? `Analyzing ${specName}…` : `Running ${specName}…`)}
                 {mode === 'done' && (success ? 'Done' : 'Failed')}
               </span>
             </>
@@ -540,7 +575,7 @@ export function AgentPanel() {
               View trace <ExternalLink className="h-3 w-3" />
             </a>
           )}
-          {panelMode === 'new' && mode === 'done' && (
+          {(panelMode === 'new' || panelMode === 'analytics') && mode === 'done' && (
             <button onClick={reset} className="flex items-center gap-1 text-xs hover:opacity-70"
               style={{ color: '#7a7068' }}>
               <RotateCcw className="h-3 w-3" /> Run another
@@ -571,8 +606,9 @@ export function AgentPanel() {
             )}
             {!historyLoading && !historyError && historyEvents.length === 0 && (
               <p className="py-8 text-center text-xs" style={{ color: '#c0b8b0' }}>
-                No persisted trace for this spec — it may have been ingested before trace
-                persistence was added. Re-run it to see the full reasoning + tool-call history here.
+                {historyInsight
+                  ? 'No persisted trace found for this insight.'
+                  : 'No persisted trace for this spec — it may have been ingested before trace persistence was added. Re-run it to see the full reasoning + tool-call history here.'}
               </p>
             )}
             {!historyLoading && historyEvents.length > 0 && (
@@ -604,8 +640,78 @@ export function AgentPanel() {
           </div>
         )}
 
-        {/* FOLDER SELECTED — confirm + run */}
-        {mode === 'folder-selected' && (
+        {/* ANALYTICS IDLE — pick which fully-executed spec to run analytics
+            against (gated the same way run_analytics_for_spec gates
+            server-side: only specs whose latest proposal reached 'executed'). */}
+        {panelMode === 'analytics' && mode === 'idle' && (
+          <div className="p-5">
+            <p className="mb-3 text-xs leading-relaxed" style={{ color: '#9c9088' }}>
+              Pick a spec whose schema has been fully executed. The analytics agent explores its
+              table live — via its own queries, not canned ones — and writes a PM-ready insight report.
+            </p>
+            {eligibleLoading && (
+              <p className="py-8 text-center text-xs" style={{ color: '#c0b8b0' }}>Loading eligible specs…</p>
+            )}
+            {!eligibleLoading && eligibleSpecs.length === 0 && (
+              <div className="flex flex-col items-center gap-3 py-10 text-center">
+                <LineChart className="h-7 w-7" style={{ color: '#c0b8b0' }} />
+                <p className="max-w-xs text-xs" style={{ color: '#9c9088' }}>
+                  No fully-executed specs yet. Run a spec through ingestion until its schema is
+                  <span className="font-semibold"> executed</span> before analytics can run on it.
+                </p>
+              </div>
+            )}
+            {!eligibleLoading && eligibleSpecs.length > 0 && (
+              <div className="rounded-xl border overflow-hidden" style={{ borderColor: '#e5dfd6' }}>
+                {eligibleSpecs.map(s => (
+                  <button
+                    key={s.spec_name}
+                    onClick={() => { setSpecName(s.spec_name); setMode('folder-selected'); }}
+                    className="w-full flex items-center justify-between gap-3 px-4 py-3 text-left hover:bg-stone-50 border-b last:border-0 transition-colors"
+                    style={{ borderColor: '#f0ece6' }}>
+                    <div className="min-w-0">
+                      <p className="text-[13px] font-semibold font-mono truncate" style={{ color: '#1c1814' }}>{s.spec_name}</p>
+                      <p className="text-[11px] font-mono truncate" style={{ color: '#9c9088' }}>{s.table_name || '—'}</p>
+                    </div>
+                    {s.has_insight > 0 && (
+                      <span className="flex-shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded"
+                        style={{ color: '#16a34a', backgroundColor: '#f0fdf4' }}>
+                        has insight
+                      </span>
+                    )}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* FOLDER SELECTED — confirm + run (ingest) / confirm + run (analytics) */}
+        {mode === 'folder-selected' && panelMode === 'analytics' && (
+          <div className="space-y-4 p-5">
+            <div className="rounded-xl border p-4" style={{ borderColor: '#e5dfd6', backgroundColor: '#faf8f5' }}>
+              <p className="text-[10px] font-bold uppercase tracking-wider" style={{ color: '#9c9088' }}>Spec</p>
+              <p className="mt-1 text-sm font-semibold font-mono" style={{ color: '#1c1814' }}>{specName}</p>
+            </div>
+
+            <button
+              onClick={() => setMode('idle')}
+              className="w-full rounded-xl border py-2 text-xs transition-colors hover:bg-stone-50"
+              style={{ borderColor: '#e5dfd6', color: '#7a7068' }}>
+              Choose a different spec
+            </button>
+
+            <button
+              onClick={handleRunAnalytics}
+              className="flex w-full items-center justify-center gap-2 rounded-xl py-3 text-sm font-semibold text-white transition-opacity hover:opacity-90"
+              style={{ backgroundColor: '#16a34a' }}>
+              <Play className="h-4 w-4" />
+              Run Analytics
+            </button>
+          </div>
+        )}
+
+        {mode === 'folder-selected' && panelMode !== 'analytics' && (
           <div className="space-y-4 p-5">
             <div className="rounded-xl border p-4 space-y-3" style={{ borderColor: '#e5dfd6', backgroundColor: '#faf8f5' }}>
               <div>
@@ -655,7 +761,7 @@ export function AgentPanel() {
             <div className="flex items-center gap-2 mb-3">
               <Loader2 className="h-3.5 w-3.5 animate-spin text-blue-500" />
               <p className="text-[10px] font-bold uppercase tracking-wider" style={{ color: '#9c9088' }}>
-                Live trace
+                {panelMode === 'analytics' ? 'Analytics agent — live trace' : 'Live trace'}
               </p>
             </div>
             {traceEvents.length === 0 && visibleLogs.length === 0 ? (
@@ -687,13 +793,25 @@ export function AgentPanel() {
                 backgroundColor: success ? '#f0fdf4' : '#fef2f2',
               }}>
               <p className="text-sm font-semibold" style={{ color: success ? '#15803d' : '#dc2626' }}>
-                {success ? '✓ Pipeline executed successfully' : `✗ Pipeline ${result.status}`}
+                {panelMode === 'analytics'
+                  ? (success ? '✓ Insight generated' : '✗ Analytics failed')
+                  : (success ? '✓ Pipeline executed successfully' : `✗ Pipeline ${result.status}`)}
               </p>
-              {result.table_name && (
+              {panelMode === 'analytics' && success && result.title && (
+                <p className="mt-1 text-xs font-medium leading-relaxed" style={{ color: '#1c1814' }}>{result.title}</p>
+              )}
+              {panelMode !== 'analytics' && result.table_name && (
                 <p className="mt-1 text-xs font-mono" style={{ color: '#1c1814' }}>{result.table_name}</p>
               )}
               {(result.error || result.reason) && (
                 <p className="mt-1.5 text-xs" style={{ color: '#7f1d1d' }}>{result.error ?? result.reason}</p>
+              )}
+              {panelMode === 'analytics' && success && result.insight_id && (
+                <a href={`/insights/${result.insight_id}`} target="_blank" rel="noopener noreferrer"
+                  className="mt-2 inline-flex items-center gap-1.5 text-xs font-semibold hover:opacity-70"
+                  style={{ color: '#16a34a' }}>
+                  View full report <ExternalLink className="h-3 w-3" />
+                </a>
               )}
             </div>
 
@@ -714,7 +832,7 @@ export function AgentPanel() {
               </details>
             )}
 
-            {success && (
+            {success && panelMode === 'new' && (
               <p className="text-center text-xs" style={{ color: '#9c9088' }}>
                 Navigating to spec detail…
               </p>

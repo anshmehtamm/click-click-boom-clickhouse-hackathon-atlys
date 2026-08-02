@@ -124,6 +124,8 @@ def _step_kind(step: str) -> str:
         return "reasoning"
     if step.endswith("_generation"):
         return "generation"
+    if step == "approved":
+        return "approved"
     if step == "executed":
         return "execution"
     if step == "context_updated":

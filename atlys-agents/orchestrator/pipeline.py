@@ -749,6 +749,21 @@ def ingest_spec(
                 proposal["confidence"] = min(proposal["confidence"], 0.4)
 
             _update_proposal_status(meta_client, proposal_id, status="approved")
+            # Its own visible step, not just a ClickHouse status write -- the
+            # gate passing (or being forced open at the revision cap) is a
+            # real, distinct milestone worth seeing on its own, between the
+            # reviewer's verdict and the real execution that follows it.
+            run.log(
+                step="approved",
+                input=None,
+                output={
+                    "table_name": proposal.get("table_name"),
+                    "verdict": review["verdict"],
+                    "revision": revision,
+                    "proceeded_at_revision_cap": at_cap and review["verdict"] != "approve",
+                    "confidence": proposal.get("confidence"),
+                },
+            )
 
             with run.span("test_harness"):
                 smoke_queries = build_smoke_queries(final_proposal["table_name"], final_proposal["columns_ddl"], pm_question_queries)

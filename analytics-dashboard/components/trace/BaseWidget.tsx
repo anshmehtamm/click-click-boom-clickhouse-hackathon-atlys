@@ -3,7 +3,7 @@ import { useState } from 'react';
 import {
   ChevronRight, ChevronDown, Database, FolderTree, BookOpen, Terminal,
   FileCode, Sparkles, GitBranch, Circle, Wrench, ShieldCheck, LineChart,
-  Rocket, BookMarked,
+  Rocket, BookMarked, BadgeCheck,
 } from 'lucide-react';
 
 export const TOOL_META: Record<string, { icon: React.ComponentType<{ className?: string; style?: React.CSSProperties }>; label: string; accent: string; bg: string }> = {
@@ -19,6 +19,7 @@ export const TOOL_META: Record<string, { icon: React.ComponentType<{ className?:
   generation:     { icon: Sparkles,    label: 'Generation',       accent: '#4f46e5', bg: '#eef2ff' },
   proposal:       { icon: Wrench,      label: 'Proposal',         accent: '#d97706', bg: '#fffbeb' },
   review:         { icon: ShieldCheck, label: 'Review',           accent: '#2563eb', bg: '#eff6ff' },
+  approved:       { icon: BadgeCheck,  label: 'Approved',         accent: '#0d9488', bg: '#f0fdfa' },
   insight:        { icon: LineChart,   label: 'Insight',          accent: '#16a34a', bg: '#f0fdf4' },
   execution:      { icon: Rocket,      label: 'Execution',        accent: '#0891b2', bg: '#ecfeff' },
   context_update: { icon: BookMarked,  label: 'Context Update',   accent: '#7c3aed', bg: '#faf5ff' },

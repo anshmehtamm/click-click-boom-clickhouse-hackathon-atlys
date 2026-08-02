@@ -309,6 +309,52 @@ export function InsightWidget({ event }: { event: AgentEvent }) {
   );
 }
 
+// ── Approved (the gate passing, distinct from the reviewer's own verdict) ─────
+// orchestrator/pipeline.py's "approved" step -- logged right where the
+// pipeline actually transitions the proposal to status="approved", between
+// the reviewer's own turn and the real execution that follows. A revision
+// that only proceeded because MAX_REVISIONS was hit (not a genuine approve)
+// is flagged distinctly rather than looking identical to a clean pass.
+
+export function ApprovedWidget({ event }: { event: AgentEvent }) {
+  const parsed = parseOutput(event.output);
+  if (!parsed) return <FallbackRaw event={event} family="approved" title="approved" />;
+
+  const { table_name, verdict, revision, proceeded_at_revision_cap, confidence } = parsed;
+
+  return (
+    <BaseWidget
+      family="approved"
+      title={table_name || 'approved'}
+      meta={undefined}
+      defaultOpen
+      collapsedPreview={proceeded_at_revision_cap ? <span className="italic">forced at revision cap</span> : undefined}
+    >
+      <div className="p-3.5 space-y-2.5">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-[11.5px] font-bold px-2 py-0.5 rounded"
+            style={{
+              color: proceeded_at_revision_cap ? '#d97706' : '#16a34a',
+              backgroundColor: proceeded_at_revision_cap ? '#d9770615' : '#16a34a15',
+            }}>
+            {proceeded_at_revision_cap ? 'Proceeding at revision cap' : 'Approved'}
+          </span>
+          <ConfidenceBadge value={confidence} />
+          {revision != null && (
+            <span className="text-[10.5px] font-mono" style={{ color: '#9c9088' }}>revision {revision}</span>
+          )}
+        </div>
+        {proceeded_at_revision_cap && (
+          <p className="text-[11.5px] leading-relaxed" style={{ color: '#7a7068' }}>
+            The reviewer's verdict was <span className="font-mono">{verdict}</span>, but the revision budget was
+            exhausted -- proceeding to execution anyway rather than looping forever, with confidence clamped down.
+          </p>
+        )}
+      </div>
+    </BaseWidget>
+  );
+}
+
 // ── Execution (what actually landed in ClickHouse) ────────────────────────────
 // orchestrator/pipeline.py's "executed" step -- deterministic Python output,
 // not an LLM turn, but the single most concrete "what happened" moment in
